@@ -231,6 +231,64 @@ try:
     _farm_log_directory = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     _farm_log_directory = os.getcwd()
+
+_CMD_CACHE = {}
+
+
+def _minescript_command(name):
+    """找出 name.py 實際位置，回傳相對 minescript 指令目錄的指令名稱（如 \\sub/name）。找不到就退回 \\name。"""
+    if name in _CMD_CACHE:
+        return _CMD_CACHE[name]
+    filename = name + ".py"
+
+    starts = []
+    try:
+        starts.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    try:
+        if sys.argv and sys.argv[0]:
+            starts.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    except Exception:
+        pass
+    starts.append(os.getcwd())
+
+    def find_root(path):
+        cur = os.path.abspath(path)
+        while True:
+            if os.path.basename(cur).lower() == "minescript":
+                return cur
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                return None
+            cur = parent
+
+    result = None
+    for start in starts:
+        root = find_root(start) or start
+        candidates = []
+        if os.path.isfile(os.path.join(start, filename)):
+            candidates.append(start)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in ("__pycache__", "system") and not d.startswith(".")
+            ]
+            if filename in filenames:
+                candidates.append(dirpath)
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda p: os.path.relpath(p, root).count(os.sep))
+        rel = os.path.relpath(best, root).replace(os.sep, "/")
+        result = "\\" + (name if rel == "." else f"{rel}/{name}")
+        break
+
+    if result is None:
+        result = "\\" + name
+    _CMD_CACHE[name] = result
+    return result
+
+
 FARM_RUNTIME_LOG = os.path.join(_farm_log_directory, "Farm_runtime.log")
 FARM_ACTIVITY_LOG = os.path.join(_farm_log_directory, "Farm_activity.log")
 FARM_WATCHDOG_STATE = os.path.join(_farm_log_directory, "Farm_watchdog_state.json")
@@ -791,7 +849,7 @@ def _restart_farm_job(reason, force_f8=None, schedule_next=False):
         開關 = False
         停止移動(reason)
         try:
-            execute("\\FarmBot/Farm")
+            execute(_minescript_command("Farm"))
         except Exception as exc:
             _restart_started.clear()
             _lifecycle["restart_f8"] = resume_f8
@@ -921,7 +979,7 @@ def _start_survival_watchdog():
             os.remove(FARM_WATCHDOG_STOP)
         except FileNotFoundError:
             pass
-        execute("\\FarmBot/Farm_watchdog")
+        execute(_minescript_command("Farm_watchdog"))
         echo("跨服存活監控已啟動")
     except Exception as exc:
         echo(f"§c跨服存活監控啟動失敗：{type(exc).__name__}: {exc}")

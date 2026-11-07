@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import sys
 import socket
 import time
 import threading
@@ -16,6 +17,64 @@ from system.lib.minescript import EventQueue, EventType, echo, execute
 
 
 ROOT = Path(__file__).resolve().parent
+
+_CMD_CACHE = {}
+
+
+def _minescript_command(name):
+    """找出 name.py 實際位置，回傳相對 minescript 指令目錄的指令名稱（如 \\sub/name）。找不到就退回 \\name。"""
+    if name in _CMD_CACHE:
+        return _CMD_CACHE[name]
+    filename = name + ".py"
+
+    starts = []
+    try:
+        starts.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    try:
+        if sys.argv and sys.argv[0]:
+            starts.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    except Exception:
+        pass
+    starts.append(os.getcwd())
+
+    def find_root(path):
+        cur = os.path.abspath(path)
+        while True:
+            if os.path.basename(cur).lower() == "minescript":
+                return cur
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                return None
+            cur = parent
+
+    result = None
+    for start in starts:
+        root = find_root(start) or start
+        candidates = []
+        if os.path.isfile(os.path.join(start, filename)):
+            candidates.append(start)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in ("__pycache__", "system") and not d.startswith(".")
+            ]
+            if filename in filenames:
+                candidates.append(dirpath)
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda p: os.path.relpath(p, root).count(os.sep))
+        rel = os.path.relpath(best, root).replace(os.sep, "/")
+        result = "\\" + (name if rel == "." else f"{rel}/{name}")
+        break
+
+    if result is None:
+        result = "\\" + name
+    _CMD_CACHE[name] = result
+    return result
+
+
 STATE_FILE = ROOT / "Farm_watchdog_state.json"
 STOP_FILE = ROOT / "Farm_watchdog.stop"
 LOCK_FILE = ROOT / ".farm_watchdog.lock"
@@ -134,7 +193,7 @@ def _process_discord_restart_queue() -> None:
             temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             os.replace(temporary, STATE_FILE)
             echo(f"§eDiscord 遠端重啟 Farm.py；恢復 F8={resume_f8}")
-            execute("\\\\FarmBot/Farm")
+            execute(_minescript_command("Farm"))
             pending["result"] = {
                 "ok": True,
                 "message": "Watchdog 已送出 Farm.py 啟動指令；"
@@ -244,7 +303,7 @@ def run_watchdog() -> None:
             try:
                 write_restart_marker(last_health, resume_f8=True)
                 echo("§eFarm.py socket 連續無回應，重新啟動 Farm.py 並恢復 F8")
-                execute("\\FarmBot/Farm")
+                execute(_minescript_command("Farm"))
                 failed_checks = 0
                 next_check_at = time.monotonic() + RECONNECT_GRACE_SECONDS
             except Exception as exc:
