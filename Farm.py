@@ -1,7 +1,7 @@
 from system.lib.minescript import *
 from system.lib.java import eval_pyjinn_script as _eval_pyjinn_script
 from pest_main import PestCleaner
-from pest_utils import look_at_block, _release_all, get_main_hand_item, check_front_crops, check_sides, player_tracker, get_current_plot, get_scoreboard_lines
+from pest_utils import look_at_block, look_at_the_block, _release_all, get_main_hand_item, check_front_crops, check_sides, player_tracker, get_current_plot, get_scoreboard_lines
 from TAB import get_tablist_info_confirmed
 from BAG import close_gui as _bag_close_gui, Find_Item, get_all_slots, click as _bag_click
 from CHAT import chatget
@@ -10,9 +10,6 @@ import builtins
 import gc
 import os
 import queue
-import farm_instance as _fi
-
-_PLAYER = _fi.detect_player_name()   # 多開：每個帳號各自的狀態 / 埠 / log
 
 # ─────────────────────────────────────────────
 # 測試模式（單人存檔）與功能開關：可由 Discord 面板即時切換，存在 Farm_watchdog_state.json
@@ -234,11 +231,10 @@ try:
     _farm_log_directory = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     _farm_log_directory = os.getcwd()
-_fi.migrate_legacy_state(_PLAYER)
-FARM_RUNTIME_LOG = str(_fi.runtime_log(_PLAYER))
-FARM_ACTIVITY_LOG = str(_fi.activity_log(_PLAYER))
-FARM_WATCHDOG_STATE = str(_fi.state_file(_PLAYER))
-FARM_WATCHDOG_STOP = str(_fi.stop_file(_PLAYER))
+FARM_RUNTIME_LOG = os.path.join(_farm_log_directory, "Farm_runtime.log")
+FARM_ACTIVITY_LOG = os.path.join(_farm_log_directory, "Farm_activity.log")
+FARM_WATCHDOG_STATE = os.path.join(_farm_log_directory, "Farm_watchdog_state.json")
+FARM_WATCHDOG_STOP = os.path.join(_farm_log_directory, "Farm_watchdog.stop")
 
 
 def _read_watchdog_state():
@@ -287,11 +283,25 @@ if _watchdog_state.get("restart_pending"):
 # ─────────────────────────────────────────────
 # 可由 Discord 調整的目標值（存在 Farm_watchdog_state.json）
 #   target_yaw    : 視角校正目標 yaw
-#   return_target : 回程 AOTV 目標點 {x_min, x_max, y, z}
+#   return_target : 回程設定 {plot, block, radius, z, x_min, x_max, y}
+#                   block 有設定 → AOTV 前掃描周圍、瞄準最近的該種方塊；
+#                   block 未設定 → 沿用舊的座標瞄準（x_min~x_max, y, z）。z 一律用來判定「是否已到原點」
 # ─────────────────────────────────────────────
 DEFAULT_TARGET_YAW = 180.0
 YAW_CHOICES = (180.0, 90.0, 0.0, -90.0)
-DEFAULT_RETURN_TARGET = {"plot": 13, "x_min": -95, "x_max": -80, "y": 66.0, "z": -144.5}
+DEFAULT_RETURN_TARGET = {"plot": 13, "x_min": -95, "x_max": -80, "y": 66.0, "z": -144.5, "block": None, "radius": 16}
+
+
+def _sanitize_block_name(value):
+    """回程瞄準的方塊 id：'minecraft:xxx[...]' 會去掉方塊狀態；空字串 / none / off 代表停用。"""
+    if value is None:
+        return None
+    text = str(value).strip().lower().split("[", 1)[0].strip()
+    if text in ("", "none", "off", "null"):
+        return None
+    if not re.fullmatch(r"[a-z0-9_:./-]+", text):
+        return None
+    return text
 
 
 def _sanitize_return_target(raw):
@@ -303,12 +313,15 @@ def _sanitize_return_target(raw):
             if "x_max" in raw: target["x_max"] = int(raw["x_max"])
             if "y" in raw: target["y"] = float(raw["y"])
             if "z" in raw: target["z"] = float(raw["z"])
+            if "radius" in raw: target["radius"] = int(raw["radius"])
+            if "block" in raw: target["block"] = _sanitize_block_name(raw["block"])
         except (TypeError, ValueError):
             return dict(DEFAULT_RETURN_TARGET)
     if not 1 <= target["plot"] <= 24:
         target["plot"] = DEFAULT_RETURN_TARGET["plot"]
     if target["x_min"] > target["x_max"]:
         target["x_min"], target["x_max"] = target["x_max"], target["x_min"]
+    target["radius"] = min(max(target["radius"], 4), 32)
     return target
 
 
@@ -344,10 +357,11 @@ def _yaw_diff(yaw, target):
 
 def _view_settings_text():
     rt = _return_target
-    return (
-        f"視角目標 yaw={_target_yaw:g}；"
-        f"回程 Plot={rt['plot']}、AOTV 目標 X={rt['x_min']}~{rt['x_max']}、Y={rt['y']:g}、Z={rt['z']:g}"
-    )
+    if rt.get("block"):
+        aim_text = f"AOTV 瞄準最近的 {rt['block']}（掃描半徑 {rt['radius']}）、到位 Z={rt['z']:g}"
+    else:
+        aim_text = f"AOTV 目標座標 X={rt['x_min']}~{rt['x_max']}、Y={rt['y']:g}、Z={rt['z']:g}（未設定瞄準方塊）"
+    return f"視角目標 yaw={_target_yaw:g}；回程 Plot={rt['plot']}、{aim_text}"
 
 
 def _read_dotenv():
@@ -799,59 +813,31 @@ def _restart_farm_job(reason, force_f8=None, schedule_next=False):
         return True
 
 
-def _bind_control_socket():
-    """幫這個帳號挑控制埠：優先沿用上次登記的埠，其次從 BASE_PORT 往上找空位。"""
-    deadline = time.monotonic() + 15.0
-    previous = _fi.read_instance(_PLAYER)
-    while not _stop_event.is_set():
-        candidates = []
-        if previous and previous.get("port"):
-            candidates.append(int(previous["port"]))
-        candidates += [p for p in range(_fi.BASE_PORT, _fi.BASE_PORT + _fi.PORT_SPAN) if p not in candidates]
-        for index, port in enumerate(candidates):
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Windows 的 SO_REUSEADDR 允許多個程式綁同一個埠，多開會互相搶；改用獨佔模式。
-            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            else:
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                server.bind((_fi.CONTROL_BIND, port))
-                server.listen(4)
-                server.settimeout(0.5)
-                return server, port
-            except OSError:
-                server.close()
-                # 舊 job 重啟收尾中：沿用的埠多等一下再放棄
-                if index == 0 and previous and time.monotonic() < deadline - 10.0:
-                    _stop_event.wait(0.5)
-        if time.monotonic() >= deadline:
-            return None, None
-        _stop_event.wait(0.5)
-    return None, None
-
-
 def _discord_control_server():
     if not _FARMBOT_CONTROL_SECRET:
         echo("§eDiscord 遠端控制未啟動：.env 缺少 FARMBOT_CONTROL_SECRET")
         return
 
-    conflict = _fi.name_conflict(_PLAYER)
-    if conflict:
-        echo(f"§c{conflict}")
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    bind_deadline = time.monotonic() + 15.0
+    while not _stop_event.is_set():
+        try:
+            server.bind(("127.0.0.1", _FARMBOT_CONTROL_PORT))
+            server.listen(4)
+            server.settimeout(0.5)
+            break
+        except OSError as exc:
+            if time.monotonic() >= bind_deadline:
+                echo(f"§cDiscord 遠端控制 socket 啟動失敗：{exc}")
+                server.close()
+                return
+            _stop_event.wait(0.5)
+    else:
+        server.close()
         return
-    server, control_port = _bind_control_socket()
-    if server is None:
-        echo("§cDiscord 遠端控制 socket 啟動失敗：找不到可用的埠")
-        return
-    _fi.register_instance(_PLAYER, control_port)
-    echo(f"Discord 遠端控制已啟動：帳號 {_PLAYER}，{_fi.advertise_host()}:{control_port}（綁定 {_fi.CONTROL_BIND}）")
-    last_registered = time.monotonic()
 
     while not _stop_event.is_set():
-        if time.monotonic() - last_registered >= 5.0:
-            _fi.register_instance(_PLAYER, control_port)   # 心跳：讓 Discord 知道這個帳號在線
-            last_registered = time.monotonic()
         try:
             conn, _ = server.accept()
         except socket.timeout:
@@ -866,16 +852,12 @@ def _discord_control_server():
                 request = json.loads(reader.readline(4096))
                 reader.close()
                 supplied_secret = str(request.get("secret", ""))
-                target_player = request.get("player")
                 if not hmac.compare_digest(supplied_secret, _FARMBOT_CONTROL_SECRET):
                     response = {"ok": False, "error": "local control authentication failed"}
-                elif target_player and str(target_player).lower() != _PLAYER.lower():
-                    response = {"ok": False, "error": f"目標帳號不符：這裡是 {_PLAYER}，不是 {target_player}"}
                 elif request.get("action") == "health":
                     heartbeat_age = time.monotonic() - _farm_heartbeat_at
                     response = {
                         "ok": heartbeat_age <= 5.0,
-                        "player": _PLAYER,
                         "heartbeat_age": heartbeat_age,
                         "f8": bool(開關),
                         "run_started_at": _run_started_at,
@@ -1071,7 +1053,6 @@ def 回Garden監控():
 def _panel_info():
     now = time.time()
     return {
-        "player": _PLAYER,
         "f8": bool(開關),
         "farming": bool(農業中),
         "pest_active": bool(害蟲處理中),
@@ -1163,9 +1144,20 @@ def _process_discord_requests():
                         if requested_yaw not in YAW_CHOICES:
                             raise ValueError(f"yaw 只能是 {', '.join(f'{c:g}' for c in YAW_CHOICES)}")
                         new_yaw = requested_yaw
-                    for key, caster in (("plot", int), ("x_min", int), ("x_max", int), ("y", float), ("z", float)):
+                    for key, caster in (("plot", int), ("x_min", int), ("x_max", int), ("y", float), ("z", float), ("radius", int)):
                         if params.get(key) is not None:
                             new_target[key] = caster(params[key])
+                    if params.get("block") is not None:
+                        new_target["block"] = _sanitize_block_name(params["block"])   # "none" = 停用
+                    if params.get("crosshair"):
+                        targeted = player_get_targeted_block(20)
+                        if targeted is None:
+                            raise ValueError("準心 20 格內沒有對準任何方塊，請先看向要當回程目標的方塊")
+                        new_target["block"] = _sanitize_block_name(targeted.type)
+                        if not new_target["block"]:
+                            raise ValueError(f"無法辨識準心方塊：{targeted.type}")
+                    if not 4 <= new_target["radius"] <= 32:
+                        raise ValueError("掃描半徑需介於 4 到 32")
                     if not 1 <= new_target["plot"] <= 24:
                         raise ValueError("Plot 需介於 1 到 24")
                     if not -64.0 <= new_target["y"] <= 320.0:
@@ -1245,7 +1237,7 @@ def _process_discord_requests():
                     resumed = 恢復防故障暫停()
                     pending["result"] = {"ok": bool(resumed), "message": "已解除 Anti-Fail" if resumed else "位置／視角檢查未通過，仍保持暫停"}
             elif action == "screenshot":
-                filename = f"farmbot_{_PLAYER}_{time.time_ns()}.png"
+                filename = f"farmbot_{time.time_ns()}.png"
                 screenshot(filename)
                 game_root = os.path.dirname(os.path.dirname(_farm_log_directory))
                 image_path = os.path.join(game_root, "screenshots", filename)
@@ -1256,7 +1248,6 @@ def _process_discord_requests():
                     echo(f"Discord 記分板快照讀取失敗：{type(exc).__name__}: {exc}")
                 pending["result"] = {
                     "ok": True,
-                    "player": _PLAYER,
                     "screenshot": image_path,
                     "scoreboard": scoreboard,
                 }
@@ -1505,7 +1496,16 @@ def 傳回農田初始點():
                     break
                 _release_all()
 
-                看點成功 = look_at_block(random.randint(回程目標["x_min"], 回程目標["x_max"]), 回程目標["y"], 目標Z)
+                if 回程目標.get("block"):
+                    # 掃描周圍方塊，瞄準最近且準心真的打得到的同類型方塊
+                    看點成功 = look_at_the_block(
+                        回程目標["block"], reach=float(回程目標["radius"]),
+                        exact=True, max_tries=8, timeout=6.0,
+                    )
+                    if not 看點成功:
+                        echo(f"§e半徑 {回程目標['radius']} 格內找不到可瞄準的 {回程目標['block']}")
+                else:
+                    看點成功 = look_at_block(random.randint(回程目標["x_min"], 回程目標["x_max"]), 回程目標["y"], 目標Z)
                 if not 看點成功:
                     _release_all()
                     echo("§e回原點目標無法確認，取消本次 AOTV，稍後重新傳送")

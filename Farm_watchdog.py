@@ -13,16 +13,14 @@ import builtins
 from pathlib import Path
 
 from system.lib.minescript import EventQueue, EventType, echo, execute
-import farm_instance as fi
 
 
 ROOT = Path(__file__).resolve().parent
-PLAYER = fi.detect_player_name()          # 這個 Minecraft 視窗的帳號名稱（多開用）
-fi.migrate_legacy_state(PLAYER)
-STATE_FILE = fi.state_file(PLAYER)
-STOP_FILE = fi.stop_file(PLAYER)
-LOCK_FILE = fi.watchdog_lock_file(PLAYER)
-CONTROL_HOST = fi.local_connect_host()   # 自己連自己的埠；跨設備連線由 fi.connect_host(instance) 決定
+STATE_FILE = ROOT / "Farm_watchdog_state.json"
+STOP_FILE = ROOT / "Farm_watchdog.stop"
+LOCK_FILE = ROOT / ".farm_watchdog.lock"
+CONTROL_HOST = "127.0.0.1"
+CONTROL_PORT = 38751
 POLL_SECONDS = 3.0
 RECONNECT_GRACE_SECONDS = 8.0
 FAILED_CHECKS_BEFORE_RESTART = 3
@@ -44,6 +42,10 @@ def read_env() -> dict[str, str]:
 
 ENV = read_env()
 CONTROL_SECRET = ENV.get("FARMBOT_CONTROL_SECRET", "")
+try:
+    CONTROL_PORT = int(ENV.get("FARMBOT_CONTROL_PORT", str(CONTROL_PORT)))
+except ValueError:
+    CONTROL_PORT = 38751
 
 
 def acquire_single_instance_lock():
@@ -75,14 +77,11 @@ def request_health(timeout: float = 2.0) -> dict | None:
     if not CONTROL_SECRET:
         return None
     payload = json.dumps(
-        {"action": "health", "secret": CONTROL_SECRET, "player": PLAYER},
+        {"action": "health", "secret": CONTROL_SECRET},
         separators=(",", ":"),
     ).encode("utf-8") + b"\n"
-    instance = fi.read_instance(PLAYER)
-    if instance is None:
-        return None
     try:
-        with socket.create_connection((CONTROL_HOST, int(instance["port"])), timeout=timeout) as conn:
+        with socket.create_connection((CONTROL_HOST, CONTROL_PORT), timeout=timeout) as conn:
             conn.settimeout(timeout)
             conn.sendall(payload)
             data = bytearray()
@@ -100,52 +99,29 @@ def request_health(timeout: float = 2.0) -> dict | None:
 
 
 
-# Discord-to-MineScript bridge：execute() 只能由「該帳號自己的」Watchdog 呼叫。
-# bot 可能跑在別的帳號的視窗裡，所以用檔案傳遞重啟要求：
-#   instances/<玩家>.restart_req（bot 寫入）→ 該帳號 Watchdog 處理 → instances/<玩家>.restart_res
-def _restart_req_path(player: str) -> Path:
-    return fi.INSTANCE_DIR / f"{player}.restart_req"
+# Discord-to-MineScript bridge: execute() is called only by the Watchdog thread.
+_DISCORD_RESTART_QUEUE = queue.Queue()
 
-
-def _restart_res_path(player: str) -> Path:
-    return fi.INSTANCE_DIR / f"{player}.restart_res"
-
-
-def _queue_restart_from_discord(player: str, timeout: float = 12.0) -> dict:
-    try:
-        fi.INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
-        request_id = str(time.time_ns())
-        _restart_res_path(player).unlink(missing_ok=True)
-        _restart_req_path(player).write_text(request_id, encoding="utf-8")
-    except OSError as exc:
-        return {"ok": False, "error": f"無法送出重啟要求：{exc}"}
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            data = json.loads(_restart_res_path(player).read_text(encoding="utf-8"))
-            if data.get("id") == request_id:
-                return data.get("result") or {"ok": False, "error": "Watchdog 未回傳重啟結果。"}
-        except (OSError, ValueError):
-            pass
-        time.sleep(0.3)
-    return {"ok": False, "error": f"{player} 的 Watchdog 尚未回應 Farm 重啟要求，請稍後再試。"}
-
+def _queue_restart_from_discord(timeout: float = 12.0) -> dict:
+    pending = {"event": threading.Event(), "result": None}
+    _DISCORD_RESTART_QUEUE.put(pending)
+    if not pending["event"].wait(timeout):
+        return {"ok": False, "error": "Watchdog 尚未回應 Farm 重啟要求，請稍後再試。"}
+    return pending["result"] or {"ok": False, "error": "Watchdog 未回傳重啟結果。"}
 
 def _process_discord_restart_queue() -> None:
-    req_path = _restart_req_path(PLAYER)
-    try:
-        request_id = req_path.read_text(encoding="utf-8").strip()
-        req_path.unlink()
-    except OSError:
-        return
-    result: dict = {}
-    try:
-        health = request_health(timeout=1.0)
-        if health is not None and health.get("ok"):
-            farm_result = request_farm(PLAYER, "restart", timeout=8.0, fallback=False)
-            if farm_result.get("ok") or "not responding" not in str(farm_result.get("error", "")):
-                result = farm_result
-        if not result:
+    while True:
+        try:
+            pending = _DISCORD_RESTART_QUEUE.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            health = request_health(timeout=1.0)
+            if health is not None and health.get("ok"):
+                result = request_farm("restart", timeout=8.0)
+                if result is not None:
+                    pending["result"] = result
+                    continue
             try:
                 state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
                 if not isinstance(state, dict):
@@ -158,18 +134,19 @@ def _process_discord_restart_queue() -> None:
             temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             os.replace(temporary, STATE_FILE)
             echo(f"§eDiscord 遠端重啟 Farm.py；恢復 F8={resume_f8}")
-            execute("\\FarmBot/Farm")
-            result = {
+            execute("\\\\FarmBot/Farm")
+            pending["result"] = {
                 "ok": True,
                 "message": "Watchdog 已送出 Farm.py 啟動指令；"
-                           + ("F8 將恢復開啟。" if resume_f8 else "F8 將維持關閉。"),
+                           + ("F8 將恢復開啟。" if resume_f8 else "F8 將維持關閉。")
             }
-    except Exception as exc:
-        result = {"ok": False, "error": f"Watchdog 處理重啟失敗：{type(exc).__name__}: {exc}"}
-    try:
-        _restart_res_path(PLAYER).write_text(json.dumps({"id": request_id, "result": result}, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass
+        except Exception as exc:
+            pending["result"] = {
+                "ok": False,
+                "error": f"Watchdog 處理重啟失敗：{type(exc).__name__}: {exc}"
+            }
+        finally:
+            pending["event"].set()
 
 
 def write_restart_marker(health: dict | None, resume_f8: bool) -> None:
@@ -198,13 +175,13 @@ def run_watchdog() -> None:
         echo("§cFarm watchdog 未啟動：.env 缺少 FARMBOT_CONTROL_SECRET")
         return
 
-    start_embedded_discord_bot()   # 多開時只有搶到鎖的那個視窗會真的跑 bot，其餘持續待命接手
+    start_embedded_discord_bot()
     connected = True  # 由 Farm.py 啟動時，Minecraft 當下已連線至世界。
     next_check_at = time.monotonic() + RECONNECT_GRACE_SECONDS
     failed_checks = 0
     last_f8 = False
     last_health: dict | None = None
-    echo(f"Farm watchdog 已啟動（帳號 {PLAYER}），將在跨服重連後檢查 Farm.py socket")
+    echo("Farm watchdog 已啟動，將在跨服重連後檢查 Farm.py socket")
 
     with EventQueue() as events:
         events.register_world_listener()
@@ -292,23 +269,24 @@ def main() -> None:
 
 
 
-# ═════════════════════════════════════════════
-# Discord bridge（多帳號版）
-#   - 一支 bot 控制多個 Minecraft 視窗；每個視窗的 Farm.py 以玩家名稱登記在 instances/
-#   - 每個指令都有 player 參數（可自動完成）；只有一個帳號在線時可省略
-#   - /farm_panel 為每個帳號各開一個面板，面板上的按鈕只作用於該帳號
-#   - bot 本體只會在一個視窗執行（檔案鎖）；該視窗關掉後，其他視窗的 Watchdog 會接手
-# ═════════════════════════════════════════════
+# ===== Discord bridge copied from original discord_control.py =====
+"""Discord bridge for FarmBot. Run with the same Python installation as Minescript."""
+
 import asyncio
+import json
+import os
+import socket
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 
+ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
-TARGET_CHANNEL_ID = 1554414633627160656
+TARGET_CHANNEL_ID = 1554414633627160656   # 可在 .env 用 DISCORD_CHANNEL_ID 覆蓋（更新腳本時不會被蓋掉）
 
 
 def load_env_file() -> None:
@@ -326,6 +304,10 @@ def load_env_file() -> None:
 
 
 load_env_file()
+try:
+    TARGET_CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "") or TARGET_CHANNEL_ID)
+except ValueError:
+    pass
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 CONTROL_SECRET = os.environ.get("FARMBOT_CONTROL_SECRET", "").strip()
 ALLOWED_USER_IDS = {
@@ -335,20 +317,16 @@ ALLOWED_USER_IDS = {
 }
 
 
-def request_farm(player: str, action: str, timeout: float = 8.0, fallback: bool = True, **parameters) -> dict:
-    """對指定帳號的 Farm.py 送出控制要求。"""
+def request_farm(action: str, timeout: float = 8.0, **parameters) -> dict:
     if not CONTROL_SECRET:
         return {"ok": False, "error": "FARMBOT_CONTROL_SECRET is not configured"}
-    instance = fi.read_instance(player)
-    if instance is None:
-        return {"ok": False, "error": f"找不到 {player} 的控制埠（該帳號尚未啟動 Farm.py）"}
 
     payload = json.dumps(
-        {"action": action, "secret": CONTROL_SECRET, "player": player, **parameters},
+        {"action": action, "secret": CONTROL_SECRET, **parameters},
         ensure_ascii=False,
     ).encode("utf-8") + b"\n"
     try:
-        with socket.create_connection((fi.connect_host(instance), int(instance["port"])), timeout=timeout) as conn:
+        with socket.create_connection((CONTROL_HOST, CONTROL_PORT), timeout=timeout) as conn:
             conn.settimeout(timeout)
             conn.sendall(payload)
             chunks = bytearray()
@@ -362,14 +340,14 @@ def request_farm(player: str, action: str, timeout: float = 8.0, fallback: bool 
         line = bytes(chunks).split(b"\n", 1)[0]
         return json.loads(line.decode("utf-8")) if line else {"ok": False, "error": "empty response"}
     except Exception as exc:
-        if action == "restart" and fallback:
-            return _queue_restart_from_discord(player)
+        if action == "restart":
+            return _queue_restart_from_discord()
         return {"ok": False, "error": f"Farm.py is not responding: {type(exc).__name__}: {exc}"}
 
 
 intents = discord.Intents.none()
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
-_report_ok: dict[str, bool] = {}
+last_delivery_failed = False
 
 
 async def is_authorized(interaction: discord.Interaction) -> bool:
@@ -392,40 +370,6 @@ def _discord_log(message: str) -> None:
             stream.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
     except OSError:
         pass
-
-
-async def player_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    needle = current.lower()
-    choices = []
-    for inst in fi.list_instances():
-        if needle in inst["name"].lower():
-            label = inst["name"] if inst["online"] else f"{inst['name']}（離線）"
-            choices.append(app_commands.Choice(name=label, value=inst["name"]))
-    return choices[:25]
-
-
-PLAYER_HELP = "要控制的 Minecraft 帳號（只有一個帳號在線時可省略）"
-
-
-async def run_on_player(
-    interaction: discord.Interaction,
-    player: str | None,
-    action: str,
-    timeout: float = 8.0,
-    **params,
-) -> None:
-    """共用流程：驗證 → 選對象 → 送指令 → 回覆（訊息前面標示帳號名稱）。"""
-    if not await is_authorized(interaction):
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    inst, error = fi.find_instance(player)
-    if inst is None:
-        await interaction.followup.send(error, ephemeral=True)
-        return
-    name = inst["name"]
-    result = await asyncio.to_thread(request_farm, name, action, timeout, **params)
-    text = result.get("message", result.get("error", "操作失敗"))
-    await interaction.followup.send(f"**[{name}]** {text}", ephemeral=True)
 
 
 @bot.event
@@ -451,79 +395,57 @@ async def on_ready() -> None:
     print(f"FarmBot Discord bridge ready as {bot.user}")
 
 
-@bot.tree.command(name="farm_list", description="列出偵測到的所有 Minecraft 帳號與狀態")
-async def farm_list(interaction: discord.Interaction) -> None:
+@bot.tree.command(name="farm_toggle", description="遠端切換 Farm.py 的 F8 開關")
+async def farm_toggle(interaction: discord.Interaction) -> None:
     if not await is_authorized(interaction):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    instances = fi.list_instances()
-    if not instances:
-        await interaction.followup.send("尚未偵測到任何帳號（還沒有 Farm.py 登記過）。", ephemeral=True)
-        return
-
-    async def one(inst: dict):
-        if not inst["online"]:
-            return inst, None
-        res = await asyncio.to_thread(request_farm, inst["name"], "panel", 4.0)
-        return inst, (res.get("info") if res.get("ok") else None)
-
-    rows = await asyncio.gather(*(one(inst) for inst in instances))
-    lines = []
-    for inst, info in rows:
-        if info:
-            extras = ""
-            if info.get("test_mode"):
-                extras += " · 🧪測試模式"
-            if info.get("anti_fail"):
-                extras += " · 🔴Anti-Fail"
-            lines.append(
-                f"🟢 **{inst['name']}** · F8 {'開' if info.get('f8') else '關'}"
-                f" · 農業 {'進行中' if info.get('farming') else '暫停'}"
-                f" · 剩餘 {info.get('remaining') or '—'}{extras}"
-            )
-        elif inst["online"]:
-            lines.append(f"🟡 **{inst['name']}** · 有心跳但沒有回應")
-        else:
-            lines.append(f"⚫ **{inst['name']}** · 離線")
-    embed = discord.Embed(title="FarmBot 帳號列表", description="\n".join(lines), color=0x3498DB)
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="farm_toggle", description="遠端切換 Farm.py 的 F8 開關")
-@app_commands.describe(player=PLAYER_HELP)
-@app_commands.autocomplete(player=player_autocomplete)
-async def farm_toggle(interaction: discord.Interaction, player: str | None = None) -> None:
-    await run_on_player(interaction, player, "toggle")
+    result = await asyncio.to_thread(request_farm, "toggle")
+    await interaction.followup.send(
+        result.get("message", result.get("error", "操作失敗")),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="farm_restart", description="遠端重新啟動 Farm.py")
-@app_commands.describe(player=PLAYER_HELP)
-@app_commands.autocomplete(player=player_autocomplete)
-async def farm_restart(interaction: discord.Interaction, player: str | None = None) -> None:
-    await run_on_player(interaction, player, "restart", 15.0)
+async def farm_restart(interaction: discord.Interaction) -> None:
+    if not await is_authorized(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await asyncio.to_thread(request_farm, "restart")
+    await interaction.followup.send(
+        result.get("message", result.get("error", "操作失敗")),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="farm_status", description="查看 Farm.py 開關與工作狀態")
-@app_commands.describe(player=PLAYER_HELP)
-@app_commands.autocomplete(player=player_autocomplete)
-async def farm_status(interaction: discord.Interaction, player: str | None = None) -> None:
-    await run_on_player(interaction, player, "status")
+async def farm_status(interaction: discord.Interaction) -> None:
+    if not await is_authorized(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await asyncio.to_thread(request_farm, "status")
+    await interaction.followup.send(
+        result.get("message", result.get("error", "操作失敗")),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="farm_add_time", description="延長目前 Farm.py 的運行時間")
-@app_commands.describe(minutes="要增加的分鐘數（1 到 1440）", player=PLAYER_HELP)
-@app_commands.autocomplete(player=player_autocomplete)
-async def farm_add_time(
-    interaction: discord.Interaction,
-    minutes: app_commands.Range[int, 1, 1440],
-    player: str | None = None,
-) -> None:
-    await run_on_player(interaction, player, "add_time", minutes=minutes)
+@app_commands.describe(minutes="要增加的分鐘數（1 到 1440）")
+async def farm_add_time(interaction: discord.Interaction, minutes: app_commands.Range[int, 1, 1440]) -> None:
+    if not await is_authorized(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await asyncio.to_thread(request_farm, "add_time", minutes=minutes)
+    await interaction.followup.send(
+        result.get("message", result.get("error", "操作失敗")),
+        ephemeral=True,
+    )
 
 
-@bot.tree.command(name="farm_yaw", description="選擇視角校正的目標 yaw（會存入該帳號的 json）")
-@app_commands.describe(yaw="目標 yaw", player=PLAYER_HELP)
-@app_commands.autocomplete(player=player_autocomplete)
+@bot.tree.command(name="farm_yaw", description="選擇視角校正的目標 yaw（會存入 json）")
+@app_commands.describe(yaw="目標 yaw")
 @app_commands.choices(
     yaw=[
         app_commands.Choice(name="180（預設）", value=180),
@@ -532,47 +454,62 @@ async def farm_add_time(
         app_commands.Choice(name="-90", value=-90),
     ]
 )
-async def farm_yaw(
-    interaction: discord.Interaction,
-    yaw: app_commands.Choice[int],
-    player: str | None = None,
-) -> None:
-    await run_on_player(interaction, player, "set_view", yaw=yaw.value)
+async def farm_yaw(interaction: discord.Interaction, yaw: app_commands.Choice[int]) -> None:
+    if not await is_authorized(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await asyncio.to_thread(request_farm, "set_view", yaw=yaw.value)
+    await interaction.followup.send(
+        result.get("message", result.get("error", "操作失敗")),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="farm_return_target", description="設定回程 AOTV 目標點（存入 json；不填任何參數則顯示目前值）")
 @app_commands.describe(
     plot="回程先傳送到的 Plot（1 到 24，預設 13）",
-    z="目標 Z（預設 -144.5）",
-    y="看向的 Y（預設 66）",
-    x_min="看向的 X 隨機範圍下限（預設 -95）",
-    x_max="看向的 X 隨機範圍上限（預設 -80）",
+    block="AOTV 要瞄準的方塊 id，例如 minecraft:gold_block（填 none 停用，改回座標瞄準）",
+    crosshair="把準心目前對準的方塊設為回程瞄準方塊",
+    radius="掃描周圍方塊的半徑（4 到 32，預設 16）",
+    z="到位判定用的 Z（預設 -144.5）；未設定方塊時也是瞄準座標",
+    y="（座標模式）看向的 Y（預設 66）",
+    x_min="（座標模式）看向的 X 隨機範圍下限（預設 -95）",
+    x_max="（座標模式）看向的 X 隨機範圍上限（預設 -80）",
     reset="還原所有預設值（視角與回程目標）",
-    player=PLAYER_HELP,
 )
-@app_commands.autocomplete(player=player_autocomplete)
 async def farm_return_target(
     interaction: discord.Interaction,
     plot: app_commands.Range[int, 1, 24] | None = None,
+    block: str | None = None,
+    crosshair: bool = False,
+    radius: app_commands.Range[int, 4, 32] | None = None,
     z: float | None = None,
     y: float | None = None,
     x_min: int | None = None,
     x_max: int | None = None,
     reset: bool = False,
-    player: str | None = None,
 ) -> None:
-    values = {"plot": plot, "z": z, "y": y, "x_min": x_min, "x_max": x_max}
+    if not await is_authorized(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    values = {"plot": plot, "block": block, "radius": radius, "z": z, "y": y, "x_min": x_min, "x_max": x_max}
     values = {key: value for key, value in values.items() if value is not None}
+    if crosshair:
+        values["crosshair"] = True
     if reset:
-        await run_on_player(interaction, player, "set_view", reset=True)
+        result = await asyncio.to_thread(request_farm, "set_view", reset=True)
     elif values:
-        await run_on_player(interaction, player, "set_view", **values)
+        result = await asyncio.to_thread(request_farm, "set_view", **values)
     else:
-        await run_on_player(interaction, player, "get_view")
+        result = await asyncio.to_thread(request_farm, "get_view")
+    await interaction.followup.send(
+        result.get("message", result.get("error", "操作失敗")),
+        ephemeral=True,
+    )
 
 
 # ═════════════════════════════════════════════
-# 完整控制面板：/farm_panel（每個帳號一個面板）
+# 完整控制面板：/farm_panel
 # ═════════════════════════════════════════════
 PANEL_FEATURES = (
     ("pest", "除蟲"),
@@ -582,11 +519,10 @@ PANEL_FEATURES = (
     ("bonus", "Bonus"),
 )
 PANEL_YAWS = (180, 90, 0, -90)
-PANEL_TITLE = "FarmBot 控制面板"
 
 
-async def fetch_panel(player: str) -> tuple[dict | None, str | None]:
-    result = await asyncio.to_thread(request_farm, player, "panel")
+async def fetch_panel() -> tuple[dict | None, str | None]:
+    result = await asyncio.to_thread(request_farm, "panel")
     if result.get("ok") and isinstance(result.get("info"), dict):
         return result["info"], None
     return None, result.get("error") or result.get("message") or "未知錯誤"
@@ -599,16 +535,14 @@ def _health_text(info: dict) -> str:
     return f"{low:g} < HP < {high:g}"
 
 
-def build_panel_embed(player: str, info: dict | None, error: str | None = None) -> discord.Embed:
-    # 標題格式「FarmBot 控制面板 · 玩家名」：按鈕觸發時靠它判斷要控制哪個帳號
-    title = f"{PANEL_TITLE} · {player}"
+def build_panel_embed(info: dict | None, error: str | None = None) -> discord.Embed:
     if info is None:
         return discord.Embed(
-            title=title,
+            title="FarmBot 控制面板",
             description=f"❌ Farm.py 沒有回應\n{error or ''}".strip(),
             color=0xE74C3C,
         )
-    embed = discord.Embed(title=title, color=0x2ECC71 if info.get("f8") else 0x95A5A6)
+    embed = discord.Embed(title="FarmBot 控制面板", color=0x2ECC71 if info.get("f8") else 0x95A5A6)
     anti_fail = info.get("anti_fail")
     state_lines = [
         f"F8：{'🟢 開' if info.get('f8') else '⚪ 關'}",
@@ -628,21 +562,15 @@ def build_panel_embed(player: str, info: dict | None, error: str | None = None) 
     target = info.get("return_target") or {}
     embed.add_field(
         name="視角／回程",
-        value=f"yaw {info.get('yaw'):g} · Plot {target.get('plot')}" if info.get("yaw") is not None else "—",
+        value=(
+            f"yaw {info.get('yaw'):g} · Plot {target.get('plot')} · "
+            + (f"瞄準 {target['block']}（r={target.get('radius')}）" if target.get("block") else "座標瞄準")
+        ) if info.get("yaw") is not None else "—",
         inline=True,
     )
     taiwan_time = timezone(timedelta(hours=8), name="Taiwan")
-    embed.set_footer(text=f"{player} · " + datetime.now(taiwan_time).strftime("更新於 %H:%M:%S 台灣時間"))
+    embed.set_footer(text=datetime.now(taiwan_time).strftime("更新於 %H:%M:%S 台灣時間"))
     return embed
-
-
-def player_from_message(interaction: discord.Interaction) -> str | None:
-    message = interaction.message
-    if message is not None and message.embeds:
-        title = message.embeds[0].title or ""
-        if title.startswith(PANEL_TITLE) and " · " in title:
-            return title.split(" · ", 1)[1].strip() or None
-    return None
 
 
 class PanelButton(discord.ui.Button):
@@ -698,11 +626,6 @@ class PanelView(discord.ui.View):
 class PestNowModal(discord.ui.Modal, title="立即除蟲"):
     plot = discord.ui.TextInput(label="Plot（1~24；測試模式可填 0＝目前位置）", default="0", max_length=2)
 
-    def __init__(self, player: str) -> None:
-        super().__init__()
-        self.player = player
-        self.title = f"立即除蟲 · {player}"[:45]
-
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -710,119 +633,88 @@ class PestNowModal(discord.ui.Modal, title="立即除蟲"):
         except ValueError:
             await interaction.followup.send("Plot 必須是數字。", ephemeral=True)
             return
-        result = await asyncio.to_thread(request_farm, self.player, "pest_now", plot=plot)
-        await interaction.followup.send(f"**[{self.player}]** " + result.get("message", result.get("error", "操作失敗")), ephemeral=True)
+        result = await asyncio.to_thread(request_farm, "pest_now", plot=plot)
+        await interaction.followup.send(result.get("message", result.get("error", "操作失敗")), ephemeral=True)
 
 
 class PestHealthModal(discord.ui.Modal, title="蟲血量範圍"):
     low = discord.ui.TextInput(label="下限（HP 必須大於此值）", placeholder="例：0（兩格都留空＝還原預設）", required=False, max_length=9)
     high = discord.ui.TextInput(label="上限（HP 必須小於此值）", placeholder="例：1000000", required=False, max_length=12)
 
-    def __init__(self, player: str) -> None:
-        super().__init__()
-        self.player = player
-        self.title = f"蟲血量範圍 · {player}"[:45]
-
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         low_text, high_text = str(self.low.value).strip(), str(self.high.value).strip()
         if not low_text and not high_text:
-            result = await asyncio.to_thread(request_farm, self.player, "set_pest_health", reset=True)
+            result = await asyncio.to_thread(request_farm, "set_pest_health", reset=True)
         else:
             try:
                 low, high = float(low_text), float(high_text)
             except ValueError:
                 await interaction.followup.send("下限與上限都要填數字（或兩格都留空還原）。", ephemeral=True)
                 return
-            result = await asyncio.to_thread(request_farm, self.player, "set_pest_health", min=low, max=high)
-        await interaction.followup.send(f"**[{self.player}]** " + result.get("message", result.get("error", "操作失敗")), ephemeral=True)
+            result = await asyncio.to_thread(request_farm, "set_pest_health", min=low, max=high)
+        await interaction.followup.send(result.get("message", result.get("error", "操作失敗")), ephemeral=True)
 
 
 async def panel_dispatch(interaction: discord.Interaction, key: str, value=None) -> None:
-    # 目標帳號取自面板標題；舊版面板（標題沒有帳號）且只有一個帳號在線時自動套用
-    inst, error = fi.find_instance(player_from_message(interaction))
-    if inst is None:
-        await interaction.response.send_message(error, ephemeral=True)
-        return
-    player = inst["name"]
-
     if key == "pestnow":
-        await interaction.response.send_modal(PestNowModal(player))
+        await interaction.response.send_modal(PestNowModal())
         return
     if key == "health":
-        await interaction.response.send_modal(PestHealthModal(player))
+        await interaction.response.send_modal(PestHealthModal())
         return
 
     await interaction.response.defer()
     result: dict = {"ok": True}
     if key == "f8":
-        result = await asyncio.to_thread(request_farm, player, "toggle")
+        result = await asyncio.to_thread(request_farm, "toggle")
     elif key == "restart":
-        result = await asyncio.to_thread(request_farm, player, "restart", 15.0)
+        result = await asyncio.to_thread(request_farm, "restart", 15.0)
     elif key.startswith("feat:"):
-        result = await asyncio.to_thread(request_farm, player, "set_feature", name=key.split(":", 1)[1], value="toggle")
+        result = await asyncio.to_thread(request_farm, "set_feature", name=key.split(":", 1)[1], value="toggle")
     elif key == "test":
-        result = await asyncio.to_thread(request_farm, player, "set_test_mode", value="toggle")
+        result = await asyncio.to_thread(request_farm, "set_test_mode", value="toggle")
     elif key == "antifail":
-        result = await asyncio.to_thread(request_farm, player, "resume_anti_fail")
+        result = await asyncio.to_thread(request_farm, "resume_anti_fail")
     elif key == "add30":
-        result = await asyncio.to_thread(request_farm, player, "add_time", minutes=30)
+        result = await asyncio.to_thread(request_farm, "add_time", minutes=30)
     elif key == "yaw":
-        result = await asyncio.to_thread(request_farm, player, "set_view", yaw=value)
+        result = await asyncio.to_thread(request_farm, "set_view", yaw=value)
 
     if key == "restart":
         await asyncio.sleep(2.5)   # 新 job 需要一點時間開 socket
-    info, error = await fetch_panel(player)
+    info, error = await fetch_panel()
     try:
-        await interaction.edit_original_response(embed=build_panel_embed(player, info, error), view=PanelView(info))
+        await interaction.edit_original_response(embed=build_panel_embed(info, error), view=PanelView(info))
     except discord.HTTPException as exc:
         print(f"Panel refresh failed: {type(exc).__name__}: {exc}")
     if key != "refresh":
         message = result.get("message") or result.get("error")
         if message:
-            await interaction.followup.send(f"**[{player}]** {message}", ephemeral=True)
+            await interaction.followup.send(message, ephemeral=True)
 
 
-@bot.tree.command(name="farm_panel", description="開啟 FarmBot 控制面板（每個 Minecraft 帳號一個）")
-@app_commands.describe(player="只開這個帳號的面板（不填＝為每個在線帳號各開一個）")
-@app_commands.autocomplete(player=player_autocomplete)
-async def farm_panel(interaction: discord.Interaction, player: str | None = None) -> None:
+@bot.tree.command(name="farm_panel", description="開啟 FarmBot 完整控制面板（按鈕＋測試模式）")
+async def farm_panel(interaction: discord.Interaction) -> None:
     if not await is_authorized(interaction):
         return
     await interaction.response.defer(thinking=True)
-    if player:
-        inst, error = fi.find_instance(player)
-        if inst is None:
-            await interaction.followup.send(error, ephemeral=True)
+    info, error = await fetch_panel()
+    await interaction.followup.send(embed=build_panel_embed(info, error), view=PanelView(info))
+
+
+@tasks.loop(seconds=60)
+async def periodic_report() -> None:
+    global last_delivery_failed
+    channel = bot.get_channel(TARGET_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
+        except Exception as exc:
+            print(f"Cannot access report channel: {type(exc).__name__}: {exc}")
             return
-        targets = [inst["name"]]
-    else:
-        targets = [inst["name"] for inst in fi.list_instances() if inst["online"]]
-        if not targets:
-            await interaction.followup.send("目前沒有在線的 FarmBot 帳號（Farm.py 沒有心跳）。", ephemeral=True)
-            return
-        targets = targets[:5]   # 避免一次洗版；更多帳號請用 player 參數
-    for name in targets:
-        info, error = await fetch_panel(name)
-        await interaction.followup.send(embed=build_panel_embed(name, info, error), view=PanelView(info))
 
-
-# ═════════════════════════════════════════════
-# 每分鐘快照：每個在線帳號各發一則（訊息標明帳號）
-# ═════════════════════════════════════════════
-async def report_one(channel, name: str) -> None:
-    result = await asyncio.to_thread(request_farm, name, "screenshot", 12.0)
-    if not result.get("ok") and not result.get("screenshot"):
-        # 只在「由正常變失敗」時通知一次，避免每分鐘洗版
-        if _report_ok.get(name, False):
-            _report_ok[name] = False
-            try:
-                await channel.send(f"⚠️ **{name}** 沒有回應：{result.get('error', '')}"[:1900])
-            except Exception as exc:
-                print(f"Periodic report notice failed: {type(exc).__name__}: {exc}")
-        return
-    _report_ok[name] = True
-
+    result = await asyncio.to_thread(request_farm, "screenshot", 12.0)
     # Minescript writes screenshots asynchronously in some runtime builds.
     image_path = Path(result["screenshot"]) if result.get("screenshot") else None
     if image_path:
@@ -832,7 +724,7 @@ async def report_one(channel, name: str) -> None:
             await asyncio.sleep(0.2)
     taiwan_time = timezone(timedelta(hours=8), name="Taiwan")
     timestamp = datetime.now(taiwan_time).strftime("%Y-%m-%d %H:%M:%S 台灣時間")
-    lines = [f"FarmBot 快照 · **{name}** · {timestamp}"]
+    lines = [f"FarmBot 快照 · {timestamp}"]
     scoreboard = result.get("scoreboard")
     if isinstance(scoreboard, list) and scoreboard:
         lines.extend(["記分板：", *scoreboard])
@@ -847,30 +739,17 @@ async def report_one(channel, name: str) -> None:
 
     try:
         if image_path and image_path.is_file():
-            await channel.send(content=content, file=discord.File(image_path, filename=f"farmbot_{name}.png"))
+            await channel.send(content=content, file=discord.File(image_path, filename="farmbot.png"))
             try:
                 image_path.unlink()
             except OSError:
                 pass
         else:
             await channel.send(content=content)
+        last_delivery_failed = False
     except Exception as exc:
-        print(f"Periodic report failed ({name}): {type(exc).__name__}: {exc}")
-
-
-@tasks.loop(seconds=60)
-async def periodic_report() -> None:
-    channel = bot.get_channel(TARGET_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
-        except Exception as exc:
-            print(f"Cannot access report channel: {type(exc).__name__}: {exc}")
-            return
-    # 登記過的帳號：線上的照常快照；剛離線的也試一次，才能發出「沒有回應」通知
-    names = [inst["name"] for inst in fi.list_instances() if inst["online"] or _report_ok.get(inst["name"])]
-    if names:
-        await asyncio.gather(*(report_one(channel, name) for name in names), return_exceptions=True)
+        last_delivery_failed = True
+        print(f"Periodic report failed: {type(exc).__name__}: {exc}")
 
 
 @periodic_report.before_loop
@@ -878,70 +757,38 @@ async def before_periodic_report() -> None:
     await bot.wait_until_ready()
 
 
-# ═════════════════════════════════════════════
-# bot 只在一個視窗執行：搶到檔案鎖的 Watchdog 負責；它結束後其他視窗會接手
-# ═════════════════════════════════════════════
 def acquire_discord_single_instance_lock():
-    try:
-        fi.INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
-        stream = (fi.INSTANCE_DIR / ".discord_control.lock").open("a+b")
-    except OSError:
-        return None
-    stream.seek(0, os.SEEK_END)
-    if stream.tell() == 0:
-        stream.write(b"\0")
-        stream.flush()
+    lock_path = ROOT / ".discord_control.lock"
+    stream = lock_path.open("a+b")
     stream.seek(0)
     try:
         import msvcrt
 
-        try:
-            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
-            stream.close()
-            return None
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
     except ImportError:
         import fcntl
 
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            stream.close()
-            return None
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        stream.close()
+        return None
     return stream
 
 
-_bot_host_thread_started = False
-
 
 def start_embedded_discord_bot() -> None:
-    """每個視窗的 Watchdog 都呼叫；只有搶到鎖的那個會真的連上 Discord。"""
-    global _bot_host_thread_started
-    if _bot_host_thread_started:
-        return
+    """Start the original discord_control bot under the Watchdog process."""
     if not BOT_TOKEN:
         echo("§cDiscord Bot 未啟動：.env 缺少 DISCORD_BOT_TOKEN")
         return
     if not CONTROL_SECRET:
         echo("§cDiscord Bot 未啟動：.env 缺少 FARMBOT_CONTROL_SECRET")
         return
-    _bot_host_thread_started = True
 
     def discord_worker() -> None:
         import traceback
-
-        announced = False
-        while True:
-            lock_stream = acquire_discord_single_instance_lock()
-            if lock_stream is not None:
-                break
-            if not announced:
-                echo("§7Discord Bot 已由其他帳號視窗執行，本視窗待命（對方關閉後會自動接手）")
-                announced = True
-            time.sleep(10.0)
-
-        echo(f"§aDiscord Bot 由 {PLAYER} 這個視窗執行")
         try:
+            # Keep the original Bot, commands and event handlers.
             # bot.run() installs signal handlers and expects the main thread.
             asyncio.run(bot.start(BOT_TOKEN))
         except BaseException as exc:
@@ -949,12 +796,10 @@ def start_embedded_discord_bot() -> None:
             print(message)
             try:
                 with (ROOT / "Farm_watchdog_discord.log").open("a", encoding="utf-8") as stream:
-                    stream.write(message + "\n")
-                    stream.write(traceback.format_exc() + "\n")
+                    stream.write(message + "\\n")
+                    stream.write(traceback.format_exc() + "\\n")
             except OSError:
                 pass
-        finally:
-            lock_stream.close()   # 放開鎖，讓其他視窗的 Watchdog 能接手
 
     threading.Thread(target=discord_worker, name="FarmBot-Discord", daemon=True).start()
 

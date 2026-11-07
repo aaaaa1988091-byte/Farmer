@@ -15,7 +15,7 @@ import json
 from system.lib.java import eval_pyjinn_script as eps
 
 # ─────────────────────────────────────────────
-# 測試模式 / 蟲血量範圍（由 Discord 面板寫入 Farm_watchdog_state_<玩家>.json）
+# 測試模式 / 蟲血量範圍（由 Discord 面板寫入 Farm_watchdog_state.json）
 #   test_mode       : True 時視為「單人存檔測試」，不要求 Hypixel 的 plot / 計分板
 #   pest_min_health : 蟲血量下限（預設 100，不含）
 #   pest_max_health : 蟲血量上限（預設 2000，不含）
@@ -25,8 +25,7 @@ try:
     _STATE_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     _STATE_DIR = os.getcwd()
-import farm_instance as _fi
-_STATE_FILE = str(_fi.state_file(_fi.detect_player_name()))   # 多開：每個帳號各自的狀態檔
+_STATE_FILE = os.path.join(_STATE_DIR, "Farm_watchdog_state.json")
 DEFAULT_PEST_MIN_HEALTH = 100.0
 DEFAULT_PEST_MAX_HEALTH = 2000.0
 _settings_cache = {"at": 0.0, "data": {}}
