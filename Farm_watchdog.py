@@ -24,6 +24,21 @@ STATE_FILE = ROOT / "Farm_watchdog_state.json"
 BAN_STATE_FILE = ROOT / "Hypixel_ban_state.json"
 STOP_FILE = ROOT / "Farm_watchdog.stop"
 LOCK_FILE = ROOT / ".farm_watchdog.lock"
+
+
+def minescript_script_command(script_name: str) -> str:
+    """組出 Minescript 啟動指令（如 \\FarmBot/Farm）；資料夾由本檔實際位置推算，不寫死。"""
+    folder = ROOT.name
+    try:
+        import system.lib.minescript as _ms_lib
+
+        # <minescript>/system/lib/minescript.py → 往上三層就是 Minescript 目錄
+        base = Path(_ms_lib.__file__).resolve().parents[2]
+        rel = ROOT.relative_to(base).as_posix()
+        folder = "" if rel == "." else rel
+    except Exception:
+        pass
+    return "\\" + (folder + "/" if folder else "") + script_name
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 38751
 POLL_SECONDS = 3.0
@@ -139,7 +154,7 @@ def _process_discord_restart_queue() -> None:
             temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             os.replace(temporary, STATE_FILE)
             echo(f"§eDiscord 遠端重啟 Farm.py；恢復 F8={resume_f8}")
-            execute("\\\\FarmBot/Farm")
+            execute(minescript_script_command("Farm"))
             pending["result"] = {
                 "ok": True,
                 "message": "Watchdog 已送出 Farm.py 啟動指令；"
@@ -489,7 +504,7 @@ def run_watchdog() -> None:
             try:
                 write_restart_marker(last_health, resume_f8=True)
                 echo("§eFarm.py socket 連續無回應，重新啟動 Farm.py 並恢復 F8")
-                execute("\\FarmBot/Farm")
+                execute(minescript_script_command("Farm"))
                 failed_checks = 0
                 next_check_at = time.monotonic() + RECONNECT_GRACE_SECONDS
             except Exception as exc:

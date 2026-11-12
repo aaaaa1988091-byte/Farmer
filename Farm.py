@@ -537,6 +537,40 @@ FARM_WATCHDOG_STOP = os.path.join(_farm_log_directory, "Farm_watchdog.stop")
 FARM_ADMIN_LOCK = os.path.join(_farm_log_directory, "Farm_admin_lock.json")
 
 
+_SCRIPT_FOLDER_FALLBACK = "FarmBot"  # 只有在完全推算不出本檔位置時才使用
+
+
+def _minescript_script_command(script_name):
+    """組出 Minescript 啟動指令（如 \\FarmBot/Farm）。
+
+    資料夾名稱由本檔實際位置相對於 Minescript 目錄推算，不寫死特定電腦的路徑。
+    """
+    folder = None
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            import system.lib.minescript as _ms_lib
+            # <minescript>/system/lib/minescript.py → 往上三層就是 Minescript 目錄
+            base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_ms_lib.__file__))))
+            rel = os.path.relpath(here, base)
+            if not rel.startswith(".."):
+                folder = "" if rel == "." else rel.replace(os.sep, "/")
+        except Exception:
+            pass
+        if folder is None:
+            folder = os.path.basename(here)
+    except NameError:
+        folder = _SCRIPT_FOLDER_FALLBACK
+    return "\\" + (folder + "/" if folder else "") + script_name
+
+
+def _own_script_name(default):
+    try:
+        return os.path.splitext(os.path.basename(__file__))[0]
+    except NameError:
+        return default
+
+
 def _read_watchdog_state():
     try:
         with open(FARM_WATCHDOG_STATE, "r", encoding="utf-8") as state_file:
@@ -1164,7 +1198,7 @@ def _restart_farm_job(reason, force_f8=None, schedule_next=False):
         開關 = False
         停止移動(reason)
         try:
-            execute("\\FarmBot/Farm")
+            execute(_minescript_script_command(_own_script_name("Farm")))
         except Exception as exc:
             _restart_started.clear()
             _lifecycle["restart_f8"] = resume_f8
@@ -1294,7 +1328,7 @@ def _start_survival_watchdog():
             os.remove(FARM_WATCHDOG_STOP)
         except FileNotFoundError:
             pass
-        execute("\\FarmBot/Farm_watchdog")
+        execute(_minescript_script_command("Farm_watchdog"))
         echo("跨服存活監控已啟動")
     except Exception as exc:
         echo(f"§c跨服存活監控啟動失敗：{type(exc).__name__}: {exc}")
