@@ -18,6 +18,7 @@ from pest_utils import (
     is_flying, get_plot_pest_count, find_silverfish, _get_entity_pos, look_at_block,
     get_current_plot, pest_test_mode
 )
+from pest_nav import Navigator
 
 # ─────────────────────────────────────────────
 # 調校參數
@@ -32,6 +33,9 @@ AOTE_ALIGN_DEG = 4.0       # 視角誤差小於此值才發射 AOTE
 AOTE_MIN_GAP = 0.30        # 兩次 AOTE 最短間隔
 MOVE_MAX_TURN_ERR = 80.0   # 視角誤差超過此值先不前進
 NO_SNEAK_BELOW_Y = 80.0    # 低於此高度絕不蹲下
+ALLOW_LOW_DESCENT = True   # 蟲群明顯低於 NO_SNEAK_BELOW_Y 時，允許往下追（否則在高空永遠吸不到）
+CHASE_BELOW_MARGIN = 3.0   # 蟲群中心低於 NO_SNEAK_BELOW_Y 這麼多，才算「必須追下去」
+MIN_GROUND_CLEARANCE = 2.5 # 往下追時至少保持離地這麼高（避免落地掉飛）
 
 # ── 群集瞄準 ──
 REFRESH_SEC = 0.12         # 多久重掃一次蟲列表
@@ -210,6 +214,7 @@ class PestCleaner:
         self._recover_log = []
         self._corner_search_index = 0
         self._worker_thread = None
+        self.nav = Navigator(self)
 
     def clean_plot(self, plot_num, pest_count=99, timeout=300.0):
         with self._lock:
@@ -246,6 +251,7 @@ class PestCleaner:
         self._plot_num = plot_num
         self._recover_log = []
         self._corner_search_index = 0
+        self.nav.invalidate()
         self.aim.start()
         try:
             res = self._travel(plot_num)
@@ -442,6 +448,7 @@ class PestCleaner:
         self._stop_movement()
         minescript.player_press_use(False)
         self._sb_count = None
+        self.nav.invalidate()
         res = self._travel(self._plot_num)
         if res == "fail":
             self._stop_flag = True
@@ -642,6 +649,8 @@ class PestCleaner:
         anchor_id = None
         progress_t = time.time()
         last_count = len(bugs)
+        ground_t = 0.0
+        ground_cache = None
 
         # 初次：先開始轉向，再（必要時）skill reset，等待期間視角已經在轉
         p_pos = minescript.player_position()
@@ -747,6 +756,16 @@ class PestCleaner:
             err = aim.error_to(ty, tp)
             aim.set_target(ty, tp, speed=TURN_SPEED_NEAR if near else TURN_SPEED_FAR)
 
+            # ── 直線逼近會撞到方塊：改用 A* 尋路 + AOTE 繞過去 ──
+            if (not near) and self.nav.need_path(p_pos, P, stop_d):
+                self._stop_movement()
+                if self.nav.go_near(P, arrive=stop_d + 1.0):
+                    progress_t = time.time()
+                    stuck_start = None
+                    last_rp = None
+                last_shot = time.time()
+                continue
+
             # ── 遠距離：視角對準就發射 AOTE ──
             if far and err < AOTE_ALIGN_DEG and now - last_shot > AOTE_MIN_GAP:
                 self._aote_shot()
@@ -760,13 +779,25 @@ class PestCleaner:
             # （偏移為負 = 從下往上看，為正 = 從上往下看）
             bob = _perlin_1d(now * 0.25, aim_seed + 2) * 0.8
             tgt_y = P[1] + alt_off + bob
-            if p_pos[1] >= NO_SNEAK_BELOW_Y - 1.0:
+            # 蟲群明顯在下限以下：必須追下去，否則卡在高空永遠吸不到
+            chase_low = ALLOW_LOW_DESCENT and P[1] < NO_SNEAK_BELOW_Y - CHASE_BELOW_MARGIN
+            if p_pos[1] >= NO_SNEAK_BELOW_Y - 1.0 and not chase_low:
                 # 已在 80 以上：目標不要老是壓到最低點，下限隨機抬高
                 tgt_y = max(tgt_y, NO_SNEAK_BELOW_Y + floor_lift)
+            gy = None
+            if chase_low:
+                # 往下追：以「離地高度」取代固定的 80，避免降到落地
+                if now - ground_t > 0.4:
+                    ground_t = now
+                    ground_cache = self.nav.ground_y(p_pos)
+                gy = ground_cache
+                if gy is not None and gy > -1e8:
+                    tgt_y = max(tgt_y, gy + MIN_GROUND_CLEARANCE)
+            can_down = p_pos[1] > NO_SNEAK_BELOW_Y or (chase_low and gy is not None)
             if p_pos[1] < tgt_y - ALT_DEADBAND:
                 k.set("sneak", False)
                 k.set("jump", True)
-            elif p_pos[1] > tgt_y + ALT_DEADBAND and p_pos[1] > NO_SNEAK_BELOW_Y:
+            elif p_pos[1] > tgt_y + ALT_DEADBAND and can_down:
                 k.set("jump", False)
                 k.set("sneak", True)
             else:
@@ -808,12 +839,9 @@ class PestCleaner:
             return False
 
         minescript.echo("§7[PestCleaner] 計分板仍有害蟲但掃描不到，正在移動回 plot 中心")
-        self._aote_to_xz(tx, tz, interrupt_on_pest=False)
+        self._nav_to_xz(tx, tz)
         if self._stop_flag:
             return True
-        pos = minescript.player_position()
-        if math.hypot(tx - pos[0], tz - pos[2]) > CENTER_ARRIVE_R:
-            self._fly_to_xz(tx, tz, interrupt_on_pest=False)
         pos = minescript.player_position()
         arrived = math.hypot(tx - pos[0], tz - pos[2]) <= CENTER_ARRIVE_R
         minescript.echo("§a[PestCleaner] 已回到 plot 中心" if arrived else "§e[PestCleaner] 回中心移動未抵達，下一輪重試")
@@ -844,13 +872,25 @@ class PestCleaner:
         ox, oz = corners[index]
         tx, tz = cx + ox, cz + oz
         minescript.echo(f"§7[PestCleaner] 中心仍掃不到，巡查 plot 角落 {index + 1}/4")
-        self._aote_to_xz(tx, tz, interrupt_on_pest=False)
+        self._nav_to_xz(tx, tz)
         if self._stop_flag:
             return False
+        return bool(self._plot_pests())
+
+    def _nav_to_xz(self, tx, tz):
+        """移到 (tx, tz) 附近、高度不變：先用 A* + AOTE 尋路，失敗（或尋路被暫停）才退回舊的直線 AOTE / 飛行。"""
+        pos = minescript.player_position()
+        ok = self.nav.go_near((tx, pos[1] + PLAYER_EYE_HEIGHT, tz), arrive=CENTER_ARRIVE_R)
+        self._stop_movement()
+        self.aim.clear()
+        if ok or self._stop_flag:
+            return
+        self._aote_to_xz(tx, tz, interrupt_on_pest=False)
+        if self._stop_flag:
+            return
         pos = minescript.player_position()
         if math.hypot(tx - pos[0], tz - pos[2]) > CENTER_ARRIVE_R:
             self._fly_to_xz(tx, tz, interrupt_on_pest=False)
-        return bool(self._plot_pests())
 
     def _fly_to_xz(self, tx, tz, interrupt_on_pest=True):
         """水平飛向 (tx, tz)，不改變高度；可選擇在掃到目標害蟲時中止。"""

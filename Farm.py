@@ -87,7 +87,7 @@ def close_gui(resume_attack: bool = True) -> bool:
     ):
         time.sleep(random.uniform(0.1, 0.2))
         hand = get_main_hand_item(timeout=1.0)
-        if isinstance(hand, dict) and hand.get("slot") == HOE:
+        if isinstance(hand, dict) and hand.get("slot") == HOE and 農田朝向正確():
             with _attack_input_lock:
                 if 開關 and 農業中 and not 害蟲處理中 and not anti_fail_hold.is_set():
                     左鍵(True)
@@ -193,6 +193,239 @@ HOE        = 2
 噴霧        = 5
 
 
+# ===== ITEM_BRIDGE_BEGIN =====
+# ─────────────────────────────────────────────
+# 目標 yaw / pitch：直接讀「視角糾正」欄位物品（Squeaky Mousemat）lore 的 Selected Yaw / Pitch。
+# 這個值就是 100% 正確的目標，取代 Discord 設定值。
+# 做法同 CHAT.py：Python 開本機 Socket Server，遊戲內注入 Pyjinn，
+# 用 java.net.Socket + PrintWriter(UTF-8) 把「這一格」的內容推回來（只讀這一格，不讀其他物品）。
+# ─────────────────────────────────────────────
+class _ItemBridge:
+    LORE_SEP = "|~|"
+    _NUM = r"-?\d+(?:\.\d+)?"
+
+    def __init__(self):
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen(1)
+        self.port = self._socket.getsockname()[1]
+        self._cond = threading.Condition()
+        self._conn = None
+        self._closed = False
+        self._view = None      # (yaw, pitch) 或 None（物品不在 / 讀不到）
+        self._version = 0      # 每收到一份完整快照 +1
+        self.errors = []
+
+    def start(self):
+        threading.Thread(target=self._listen_loop, daemon=True).start()
+
+    def close(self):
+        self._closed = True
+        for sock in (self._conn, self._socket):
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+
+    def _listen_loop(self):
+        while not self._closed:
+            try:
+                conn, _ = self._socket.accept()
+            except Exception:
+                return
+            self._conn = conn
+            try:
+                reader = conn.makefile(encoding="utf-8", errors="replace", mode="r")
+                batch = None
+                while not self._closed:
+                    line = reader.readline()
+                    if not line:
+                        break
+                    line = line.rstrip("\r\n")
+                    if line == "BEGIN":
+                        batch = []
+                    elif line == "END":
+                        if batch is not None:
+                            self._publish(batch)
+                        batch = None
+                    elif line.startswith("ERR"):
+                        self.errors.append(line)
+                    elif batch is not None and line.startswith("I\t"):
+                        parts = line.split("\t", 6)
+                        if len(parts) >= 7:
+                            batch.append(parts[6].split(self.LORE_SEP) if parts[6] else [])
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _parse_view(self, lore_lines):
+        blob = re.sub(r"§.", "", "\n".join(lore_lines))
+        y = re.search(r"Selected\s+Yaw\s*:\s*(" + self._NUM + ")", blob)
+        p = re.search(r"Selected\s+Pitch\s*:\s*(" + self._NUM + ")", blob)
+        if y and p:
+            return float(y.group(1)), float(p.group(1))
+        return None
+
+    def _publish(self, batch):
+        view = self._parse_view(batch[0]) if batch else None
+        with self._cond:
+            self._view = view
+            self._version += 1
+            self._cond.notify_all()
+
+    def latest(self, timeout=0.0):
+        """回傳 (view, version)；timeout 內尚未收到任何快照則 version=0。"""
+        deadline = time.time() + timeout
+        with self._cond:
+            while self._version == 0:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None, 0
+                self._cond.wait(remaining)
+            return self._view, self._version
+
+
+def _build_item_pyjinn_script(port: int, slot: int) -> str:
+    return r"""
+Socket = JavaClass("java.net.Socket")
+PrintWriter = JavaClass("java.io.PrintWriter")
+OutputStreamWriter = JavaClass("java.io.OutputStreamWriter")
+StandardCharsets = JavaClass("java.nio.charset.StandardCharsets")
+DataComponents = JavaClass("net.minecraft.core.component.DataComponents")
+Registry = JavaClass("net.minecraft.core.registries.BuiltInRegistries")
+mc = JavaClass("net.minecraft.client.Minecraft").getInstance()
+
+writer = None
+try:
+    bridge_socket = Socket("127.0.0.1", """ + str(port) + r""")
+    writer = PrintWriter(OutputStreamWriter(bridge_socket.getOutputStream(), StandardCharsets.UTF_8), True)
+except Exception as e:
+    pass
+
+frame_count = 0
+last_snapshot = ""
+dead = False
+err_sent = False
+
+def clean(x):
+    try:
+        return str(x).replace("\r", " ").replace("\n", " ").replace("\t", " ").replace("|~|", " ")
+    except Exception as e:
+        return "?"
+
+def build_lines():
+    lines = []
+    inv = mc.player.getInventory()
+    for i in [__SLOT__]:
+        st = inv.getItem(i)
+        if st.isEmpty():
+            continue
+
+        item_id = "?"
+        try:
+            item_id = clean(Registry.ITEM.getKey(st.getItem()).toString())
+        except Exception as e:
+            try:
+                item_id = clean(st.getItem().toString())
+            except Exception as e2:
+                pass
+
+        name = "?"
+        try:
+            name = clean(st.getHoverName().getString())
+        except Exception as e:
+            pass
+
+        lore_parts = []
+        try:
+            lore = st.get(DataComponents.LORE)
+            if lore:
+                ll = lore.lines()
+                for j in range(ll.size()):
+                    lore_parts.append(clean(ll.get(j).getString()))
+        except Exception as e:
+            lore_parts.append("LOREERR " + clean(e))
+
+        custom = ""
+        try:
+            cd = st.get(DataComponents.CUSTOM_DATA)
+            if cd:
+                custom = clean(cd.copyTag().toString())
+        except Exception as e:
+            custom = "CUSTOMERR " + clean(e)
+
+        lines.append("I\t" + str(i) + "\t" + str(st.getCount()) + "\t" + item_id + "\t" + name + "\t" + custom + "\t" + "|~|".join(lore_parts))
+    return lines
+
+def check_items(_):
+    global frame_count, last_snapshot, dead, err_sent
+    frame_count = frame_count + 1
+    if dead or not writer:
+        return
+    if frame_count % 20 != 0:
+        return
+    try:
+        if not mc.player:
+            return
+        lines = build_lines()
+        text = "\n".join(lines)
+        if text != last_snapshot:
+            last_snapshot = text
+            writer.println("BEGIN")
+            for l in lines:
+                writer.println(l)
+            writer.println("END")
+            writer.flush()
+            if writer.checkError():
+                dead = True
+    except Exception as e:
+        if not err_sent:
+            err_sent = True
+            try:
+                writer.println("ERR " + clean(e))
+                writer.flush()
+            except Exception as e2:
+                pass
+
+add_event_listener("render", check_items)
+""".replace("__SLOT__", str(int(slot)))
+
+
+if _previous_lifecycle is not None:
+    _old_item_bridge = _previous_lifecycle.get("item_bridge")
+    if _old_item_bridge is not None:
+        _old_item_bridge.close()
+_item_bridge = _ItemBridge()
+_lifecycle["item_bridge"] = _item_bridge
+_item_bridge.start()
+try:
+    _eval_pyjinn_script(_build_item_pyjinn_script(_item_bridge.port, 視角糾正))
+except Exception as _exc:
+    echo(f"§e[視角] 糾正物品讀取橋接啟動失敗：{type(_exc).__name__}: {_exc}")
+
+_item_view_live = False   # 目前的目標值是否來自糾正物品（False＝沿用上次存檔值）
+
+
+def _sync_target_from_item(timeout=0.0):
+    """用糾正物品的 Selected Yaw / Pitch 更新目標值；讀不到回傳 False（沿用現值）。"""
+    global _target_yaw, _target_pitch, _item_view_live
+    view, version = _item_bridge.latest(timeout)
+    if version == 0 or view is None:
+        return False
+    yaw, pitch = view
+    _item_view_live = True
+    if yaw != _target_yaw or pitch != _target_pitch:
+        _target_yaw, _target_pitch = yaw, pitch
+        _write_watchdog_state(target_yaw=yaw, target_pitch=pitch)
+        echo(f"§a[視角] 目標值取自糾正物品：yaw={yaw:g}、pitch={pitch:g}")
+    return True
+# ===== ITEM_BRIDGE_END =====
+
 BOOSTERCOOKIE_SELL_ITEMS = (
     "Bookworm's Favorite Book",
     "Tool Exp Capsule",
@@ -215,6 +448,69 @@ BOOSTERCOOKIE_SELL_ITEMS = (
 BOOSTERCOOKIE_SELL_THRESHOLD = 0
 BOOSTERCOOKIE_PLAYER_SLOT_START = 54
 NETHER_WART_COMPACT_THRESHOLD = 64
+CROP_COMPACT_INGREDIENT_COUNT = 160  # 每個壓縮配方都要 160 個前一階原料；不足就不開配方介面
+# 每種 Garden 作物：recipes 由最高階排到最低階（與原本 Mutant → Enchanted 的順序相同），
+# 每項為 (/viewrecipe 內部 ID, 該配方的原料物品名稱)。原料名稱需與背包物品名稱完全一致。
+CROP_COMPACT_CONFIG = (
+    {"name": "Nether Wart", "recipes": (
+        ("MUTANT_NETHER_STALK", "Enchanted Nether Wart"),
+        ("ENCHANTED_NETHER_STALK", "Nether Wart"))},
+    {"name": "Wheat", "recipes": (
+        ("ENCHANTED_HAY_BLOCK", "Enchanted Wheat"),
+        ("ENCHANTED_WHEAT", "Wheat"))},
+    {"name": "Seeds", "recipes": (
+        ("BOX_OF_SEEDS", "Enchanted Seeds"),
+        ("ENCHANTED_SEEDS", "Seeds"))},
+    {"name": "Carrot", "recipes": (
+        ("ENCHANTED_GOLDEN_CARROT", "Enchanted Carrot"),
+        ("ENCHANTED_CARROT", "Carrot"))},
+    {"name": "Potato", "recipes": (
+        ("ENCHANTED_BAKED_POTATO", "Enchanted Potato"),
+        ("ENCHANTED_POTATO", "Potato"))},
+    {"name": "Pumpkin", "recipes": (
+        ("POLISHED_PUMPKIN", "Enchanted Pumpkin"),
+        ("ENCHANTED_PUMPKIN", "Pumpkin"))},
+    {"name": "Melon", "recipes": (
+        ("ENCHANTED_MELON_BLOCK", "Enchanted Melon Slice"),
+        ("ENCHANTED_MELON", "Melon Slice"))},
+    {"name": "Red Mushroom", "recipes": (
+        ("ENCHANTED_HUGE_MUSHROOM_2", "Enchanted Red Mushroom"),
+        ("ENCHANTED_RED_MUSHROOM", "Red Mushroom"))},
+    {"name": "Brown Mushroom", "recipes": (
+        ("ENCHANTED_HUGE_MUSHROOM_1", "Enchanted Brown Mushroom"),
+        ("ENCHANTED_BROWN_MUSHROOM", "Brown Mushroom"))},
+    {"name": "Cocoa Beans", "recipes": (
+        ("ENCHANTED_COCOA", "Cocoa Beans"),)},
+    {"name": "Cactus", "recipes": (
+        ("ENCHANTED_CACTUS", "Enchanted Cactus Green"),
+        ("ENCHANTED_CACTUS_GREEN", "Cactus"))},
+    {"name": "Sugar Cane", "recipes": (
+        ("ENCHANTED_SUGAR_CANE", "Enchanted Sugar"),
+        ("ENCHANTED_SUGAR", "Sugar Cane"))},
+)
+
+
+def _count_inventory_item(slots, item_name):
+    """玩家背包中名稱完全等於 item_name 的物品總數（不含 GUI 上半部槽位）。"""
+    wanted = str(item_name).strip().casefold()
+    return sum(
+        slot.get("count", 0)
+        for slot in slots
+        if slot.get("count", 0) > 0
+        and str(slot.get("name", "")).strip().casefold() == wanted
+    )
+
+
+def _craftable_crop_score(config, slots):
+    """此作物所有「原料足夠」配方的原料總數；0 代表目前沒有任何可合成的配方。"""
+    score = 0
+    for _recipe, ingredient in config["recipes"]:
+        count = _count_inventory_item(slots, ingredient)
+        if count >= CROP_COMPACT_INGREDIENT_COUNT:
+            score += count
+    return score
+
+
 BAZAAR_SELL_THRESHOLDS = {"Enchanted Book": 3}
 PEST_COOLDOWN_CORRECTION = 165
 PEST_COOLDOWN_TAB_REFRESH_WAIT = 4.2  # TAB 冷卻欄位約每 3–4 秒更新，切套裝後等新快照
@@ -226,73 +522,19 @@ GARDEN_LEAVE_CONFIRM_SECONDS = 3.0
 AREA_NONE_CONFIRM_SECONDS = 5.0  # None 可能是讀取瞬斷；持續超過此時間才視為離開 SkyBlock
 ANTI_FAIL_YAW_TOLERANCE = 50.0
 ANTI_FAIL_TURN_CONFIRM_SECONDS = 0.25
+ANTI_FAIL_PITCH_TOLERANCE = 12.0   # 挖田中允許的 pitch 偏差；超過就視為低頭/抬頭異常
+CORRECT_PITCH_TOLERANCE = 2.0      # 使用視角糾正物品後的嚴格驗證
+ANTI_FAIL_CORRECT_MAX_FAILS = 3    # 連續校正失敗幾次後直接鎖定，不再硬挖
 
 try:
     _farm_log_directory = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     _farm_log_directory = os.getcwd()
-
-_CMD_CACHE = {}
-
-
-def _minescript_command(name):
-    """找出 name.py 實際位置，回傳相對 minescript 指令目錄的指令名稱（如 \\sub/name）。找不到就退回 \\name。"""
-    if name in _CMD_CACHE:
-        return _CMD_CACHE[name]
-    filename = name + ".py"
-
-    starts = []
-    try:
-        starts.append(os.path.dirname(os.path.abspath(__file__)))
-    except NameError:
-        pass
-    try:
-        if sys.argv and sys.argv[0]:
-            starts.append(os.path.dirname(os.path.abspath(sys.argv[0])))
-    except Exception:
-        pass
-    starts.append(os.getcwd())
-
-    def find_root(path):
-        cur = os.path.abspath(path)
-        while True:
-            if os.path.basename(cur).lower() == "minescript":
-                return cur
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                return None
-            cur = parent
-
-    result = None
-    for start in starts:
-        root = find_root(start) or start
-        candidates = []
-        if os.path.isfile(os.path.join(start, filename)):
-            candidates.append(start)
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in ("__pycache__", "system") and not d.startswith(".")
-            ]
-            if filename in filenames:
-                candidates.append(dirpath)
-        if not candidates:
-            continue
-        best = min(candidates, key=lambda p: os.path.relpath(p, root).count(os.sep))
-        rel = os.path.relpath(best, root).replace(os.sep, "/")
-        result = "\\" + (name if rel == "." else f"{rel}/{name}")
-        break
-
-    if result is None:
-        result = "\\" + name
-    _CMD_CACHE[name] = result
-    return result
-
-
 FARM_RUNTIME_LOG = os.path.join(_farm_log_directory, "Farm_runtime.log")
 FARM_ACTIVITY_LOG = os.path.join(_farm_log_directory, "Farm_activity.log")
 FARM_WATCHDOG_STATE = os.path.join(_farm_log_directory, "Farm_watchdog_state.json")
 FARM_WATCHDOG_STOP = os.path.join(_farm_log_directory, "Farm_watchdog.stop")
+FARM_ADMIN_LOCK = os.path.join(_farm_log_directory, "Farm_admin_lock.json")
 
 
 def _read_watchdog_state():
@@ -336,6 +578,23 @@ if _watchdog_state.get("restart_pending"):
     _lifecycle["run_started_at"] = _startup_run_started_at if _startup_f8 else None
     _lifecycle["run_deadline_at"] = _startup_run_deadline_at if _startup_f8 else None
     _lifecycle["auto_restart_at"] = _startup_auto_restart_at if _startup_f8 else None
+
+# 衣櫥套裝（FARM/PEST）也存進狀態檔：重啟（含 Watchdog / Discord 重啟）後若記憶體內沒有，
+# 就沿用狀態檔最後一次成功點擊的套裝，避免「已是 FARM 又點 FARM」以及冷卻校正失準。
+LOADOUT_STATE_MAX_AGE_SECONDS = 3600.0
+if _lifecycle.get("loadout") is None:
+    _saved_loadout = _watchdog_state.get("loadout")
+    _saved_loadout_at = _watchdog_state.get("loadout_at")
+    try:
+        _loadout_fresh = (
+            isinstance(_saved_loadout, bool)
+            and _saved_loadout_at is not None
+            and 0 <= time.time() - float(_saved_loadout_at) <= LOADOUT_STATE_MAX_AGE_SECONDS
+        )
+    except (TypeError, ValueError):
+        _loadout_fresh = False
+    if _loadout_fresh:
+        _lifecycle["loadout"] = _saved_loadout
 
 
 # ─────────────────────────────────────────────
@@ -388,11 +647,23 @@ def _sanitize_target_yaw(raw):
         value = float(raw)
     except (TypeError, ValueError):
         return DEFAULT_TARGET_YAW
-    return value if value in YAW_CHOICES else DEFAULT_TARGET_YAW
+    return value if -360.0 <= value <= 360.0 else DEFAULT_TARGET_YAW
 
 
 _target_yaw = _sanitize_target_yaw(_watchdog_state.get("target_yaw", DEFAULT_TARGET_YAW))
 _return_target = _sanitize_return_target(_watchdog_state.get("return_target"))
+
+
+def _sanitize_target_pitch(raw):
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if -90.0 <= value <= 90.0 else None
+
+
+# None = 尚未學到；第一次「真的用糾正物品」且 yaw 到位後會記錄並存檔
+_target_pitch = _sanitize_target_pitch(_watchdog_state.get("target_pitch"))
 
 
 def _sanitize_features(raw):
@@ -419,7 +690,9 @@ def _view_settings_text():
         aim_text = f"AOTV 瞄準最近的 {rt['block']}（掃描半徑 {rt['radius']}）、到位 Z={rt['z']:g}"
     else:
         aim_text = f"AOTV 目標座標 X={rt['x_min']}~{rt['x_max']}、Y={rt['y']:g}、Z={rt['z']:g}（未設定瞄準方塊）"
-    return f"視角目標 yaw={_target_yaw:g}；回程 Plot={rt['plot']}、{aim_text}"
+    pitch_text = f"{_target_pitch:g}" if _target_pitch is not None else "未知"
+    src = "糾正物品" if _item_view_live else "上次記錄值（尚未讀到糾正物品）"
+    return f"視角目標 yaw={_target_yaw:g}、pitch={pitch_text}（來源：{src}）；回程 Plot={rt['plot']}、{aim_text}"
 
 
 def _read_dotenv():
@@ -568,8 +841,11 @@ def farm_attack_monitor():
                             and not 害蟲處理中
                             and not anti_fail_hold.is_set()
                         ):
-                            左鍵(True)
-                            flush()
+                            if 農田朝向正確():
+                                左鍵(True)
+                                flush()
+                            else:
+                                _farm_attack_monitor_active.clear()
                     next_attack_refresh = time.monotonic() + random.uniform(50.0, 60.0)
                 else:
                     _stop_event.wait(min(0.5, next_attack_refresh - now))
@@ -676,22 +952,43 @@ def 安全切換欄位(槽位):
 
 
 def 校正農田視角(timeout=8.0):
-    """使用安全的視角糾正物品，將 yaw 校正到目前設定的目標值（預設 180°）。"""
+    """使用視角糾正物品校正 yaw + pitch。
+
+    1. 至少真的用一次物品（不再因為 yaw 剛好吻合就跳過，那會讓回程瞄準留下的低頭 pitch 殘留）。
+    2. 成功條件 = yaw 到位 且 pitch 到位；pitch 目標第一次成功時學習並存檔。
+    3. 每次點擊前確認主手真的是糾正物品，避免切欄位延遲時拿鋤頭點到泥土。
+    """
+    global _target_pitch
+    _sync_target_from_item(0.5)
     deadline = time.time() + timeout
     target_yaw = _target_yaw
+    used_item = False
     while not _stop_event.is_set() and time.time() < deadline:
-        orientation = player_orientation()
-        if orientation and _yaw_diff(orientation[0], target_yaw) < 1.0:
-            安全切換欄位(HOE)
-            左鍵(False)
-            return True
+        if used_item:
+            orientation = player_orientation()
+            if orientation and _yaw_diff(orientation[0], target_yaw) < 1.0:
+                pitch = float(orientation[1])
+                if _target_pitch is None:
+                    _target_pitch = pitch
+                    _write_watchdog_state(target_pitch=_target_pitch)
+                    echo(f"§a[視角] 已記錄糾正後 pitch={pitch:.1f}")
+                if abs(pitch - _target_pitch) <= CORRECT_PITCH_TOLERANCE:
+                    安全切換欄位(HOE)
+                    左鍵(False)
+                    return True
 
-        安全切換欄位(視角糾正)
-        等(0.1)
+        if not 安全切換欄位(視角糾正):
+            break
+        等(0.15)
+        hand = get_main_hand_item(timeout=0.6)
+        if not (isinstance(hand, dict) and hand.get("slot") == 視角糾正):
+            等(0.1)
+            continue
         左鍵(True)
         等(0.08)
         左鍵(False)
-        等(0.25)
+        used_item = True
+        等(0.3)
 
     安全切換欄位(HOE)
     左鍵(False)
@@ -717,12 +1014,20 @@ def 確認所在Plot(attempts=3):
     return None
 
 
-def 農田朝向正確(orientation=None) -> bool:
+def 農田朝向正確(orientation=None, pitch_tolerance=ANTI_FAIL_PITCH_TOLERANCE) -> bool:
     if orientation is None:
         orientation = player_orientation()
     if not orientation:
         return False
-    return _yaw_diff(orientation[0], _target_yaw) <= ANTI_FAIL_YAW_TOLERANCE
+    if _yaw_diff(orientation[0], _target_yaw) > ANTI_FAIL_YAW_TOLERANCE:
+        return False
+    if _target_pitch is not None:
+        try:
+            if abs(float(orientation[1]) - _target_pitch) > pitch_tolerance:
+                return False
+        except (TypeError, ValueError, IndexError):
+            return False
+    return True
 
 
 def 啟動防故障暫停(reason):
@@ -744,8 +1049,10 @@ def anti_fail_monitor():
     """外力改變視角時用糾正物品復位。"""
     global 農業中
     wrong_yaw_since = None
+    correct_fail_count = 0
 
     while not _stop_event.is_set():
+        _sync_target_from_item()
         active = 開關 and not 害蟲處理中 and not anti_fail_hold.is_set() and 在花園()
         if not active:
             wrong_yaw_since = None
@@ -770,12 +1077,20 @@ def anti_fail_monitor():
                         農業中 = False
                         停止移動("視角糾正開始")
                     corrected = 校正農田視角(timeout=8.0)
-                    if 開關 and not 害蟲處理中 and not anti_fail_hold.is_set():
-                        農業中 = was_farming
                     if corrected:
+                        correct_fail_count = 0
+                        if 開關 and not 害蟲處理中 and not anti_fail_hold.is_set():
+                            農業中 = was_farming
                         echo("§a[Anti-Fail] 視角已校正，繼續目前流程")
                     else:
-                        echo("§e[Anti-Fail] 本次視角校正逾時，繼續監控並稍後重試")
+                        # 校正沒成功 → 不恢復農業，避免帶著錯誤視角繼續挖
+                        correct_fail_count += 1
+                        停止移動("視角校正失敗")
+                        if correct_fail_count >= ANTI_FAIL_CORRECT_MAX_FAILS:
+                            correct_fail_count = 0
+                            啟動防故障暫停("視角連續校正失敗，已停止以免低頭挖土")
+                        else:
+                            echo(f"§e[Anti-Fail] 視角校正失敗（{correct_fail_count}/{ANTI_FAIL_CORRECT_MAX_FAILS}），保持暫停並重試")
                 continue
         else:
             wrong_yaw_since = None
@@ -849,7 +1164,7 @@ def _restart_farm_job(reason, force_f8=None, schedule_next=False):
         開關 = False
         停止移動(reason)
         try:
-            execute(_minescript_command("Farm"))
+            execute("\\FarmBot/Farm")
         except Exception as exc:
             _restart_started.clear()
             _lifecycle["restart_f8"] = resume_f8
@@ -979,14 +1294,14 @@ def _start_survival_watchdog():
             os.remove(FARM_WATCHDOG_STOP)
         except FileNotFoundError:
             pass
-        execute(_minescript_command("Farm_watchdog"))
+        execute("\\FarmBot/Farm_watchdog")
         echo("跨服存活監控已啟動")
     except Exception as exc:
         echo(f"§c跨服存活監控啟動失敗：{type(exc).__name__}: {exc}")
 
 
 def stop_farm_scripts_from_f9():
-    """Stop this Farm.py lifecycle and its watchdog while leaving Discord alive."""
+    """F9: stop this Farm.py lifecycle, the watchdog and the Discord bot (embedded in the watchdog)."""
     global 開關
     開關 = False
     _lifecycle["restart_f8"] = False
@@ -1006,7 +1321,7 @@ def stop_farm_scripts_from_f9():
         echo(f"§c無法通知 Farm watchdog 停止：{exc}")
     _stop_event.set()
     停止移動("F9 停止 Farm 與 watchdog")
-    echo("§cF9：Farm.py 與 Farm watchdog 已要求停止；Discord bot 保持執行")
+    echo("§cF9：Farm.py、Farm watchdog 與 Discord bot 已要求全部停止")
 
 
 def 回到Garden(timeout=120.0):
@@ -1121,6 +1436,8 @@ def _panel_info():
         "feature_labels": dict(FEATURE_LABELS),
         "pest_health": [_read_watchdog_state().get("pest_min_health"), _read_watchdog_state().get("pest_max_health")],
         "yaw": _target_yaw,
+        "pitch": _target_pitch,
+        "view_live": bool(_item_view_live),
         "return_target": dict(_return_target),
     }
 
@@ -1135,7 +1452,108 @@ def _process_discord_requests():
 
         action = pending["action"]
         try:
-            if action == "toggle":
+            if action == "hypixel_ban":
+                duration_seconds = max(1, int(pending.get("duration_seconds", 1)))
+                deadline = time.time() + duration_seconds
+
+                def _ban_countdown(until):
+                    remaining = max(0, int(until - time.time()))
+                    days, remaining = divmod(remaining, 86400)
+                    hours, remaining = divmod(remaining, 3600)
+                    minutes, seconds = divmod(remaining, 60)
+                    return f"{days}d {hours}h {minutes}m {seconds}s"
+
+                display_time = _ban_countdown(deadline)
+                開關 = False
+                _lifecycle["restart_f8"] = False
+                _lifecycle["auto_restart_at"] = None
+                _write_watchdog_state(
+                    f8=False,
+                    resume_f8=False,
+                    restart_pending=False,
+                    admin_lock=True,
+                    auto_restart_at=None,
+                )
+                with open(FARM_ADMIN_LOCK, "w", encoding="utf-8") as lock_file:
+                    json.dump(
+                        {
+                            "locked": True,
+                            "created_at": time.time(),
+                            "deadline": deadline,
+                            "duration_seconds": duration_seconds,
+                            "reason": "管理員鎖定",
+                        },
+                        lock_file,
+                        ensure_ascii=False,
+                    )
+                停止移動("管理員鎖定")
+                try:
+                    countdown_literal = json.dumps(display_time, ensure_ascii=False)
+                    _eval_pyjinn_script(f"""
+mc = JavaClass("net.minecraft.client.Minecraft").getInstance()
+server = mc.getCurrentServer()
+
+if server is not None:
+    address = str(server.ip).lower().strip()
+    host = address.split(":")[0].rstrip(".")
+
+    if host == "hypixel.net" or host.endswith(".hypixel.net"):
+        Component = JavaClass("net.minecraft.network.chat.Component")
+        Formatting = JavaClass("net.minecraft.ChatFormatting")
+
+        line1 = Component.literal("You are temporarily banned for ").withColor(0xFF5555)
+        line1 = line1.append(Component.literal({countdown_literal}).withColor(0xFFFFFF))
+        line1 = line1.append(Component.literal(" from this server!").withColor(0xFF5555))
+
+        line2 = Component.literal(
+            "Reason: Your account's security appeal was processed and the account "
+            "has entered a recovery phase and will be able to access the server "
+            "again after 30 days. Use this time to change passwords, emails and "
+            "security questions."
+        ).withColor(0xFFFFFF)
+
+        line3 = Component.literal("Find out more: ").withColor(0xAAAAAA)
+        url = Component.literal("https://www.hypixel.net/appeal").withColor(0x55FFFF).withStyle(Formatting.UNDERLINE)
+        line3 = line3.append(url)
+
+        message = Component.literal("")
+        message = message.append(line1)
+        message = message.append(Component.literal("\\n"))
+        message = message.append(line2)
+        message = message.append(Component.literal("\\n"))
+        message = message.append(line3)
+
+        connection = mc.getConnection()
+        if connection is not None:
+            connection.getConnection().disconnect(message)
+""")
+                except Exception as exc:
+                    echo(f"§c已鎖定，但自訂斷線畫面顯示失敗：{type(exc).__name__}: {exc}")
+                echo(f"§c管理員鎖定：F8 已關閉；倒數：{display_time}；按 F10 才能解除")
+                pending["result"] = {
+                    "ok": True,
+                    "message": f"已停止 FarmBot 並鎖定重新加入。倒數：{display_time}；時間歸零後仍需在 Minecraft 按 F10 才能解除。",
+                }
+            elif action == "admin_unlock":
+                try:
+                    os.remove(FARM_ADMIN_LOCK)
+                except FileNotFoundError:
+                    pass
+                _lifecycle["restart_f8"] = False
+                _lifecycle["auto_restart_at"] = None
+                _write_watchdog_state(
+                    f8=False,
+                    resume_f8=False,
+                    restart_pending=False,
+                    admin_lock=False,
+                    auto_restart_at=None,
+                )
+                echo("§a管理員已解除 FarmBot 緊急鎖定；F8 維持關閉")
+                pending["result"] = {
+                    "ok": True,
+                    "message": "已解除緊急鎖定；F8 仍維持關閉，需手動確認後再啟動。",
+                }
+            elif action == "toggle":
                 開關 = not 開關
                 if 開關 and anti_fail_hold.is_set():
                     resumed = 恢復防故障暫停()
@@ -1189,19 +1607,13 @@ def _process_discord_requests():
             elif action == "set_view":
                 params = pending.get("params") or {}
                 if params.get("reset"):
-                    new_yaw = DEFAULT_TARGET_YAW
+                    new_yaw = _target_yaw
                     new_target = dict(DEFAULT_RETURN_TARGET)
                 else:
                     new_yaw = _target_yaw
                     new_target = dict(_return_target)
                     if params.get("yaw") is not None:
-                        try:
-                            requested_yaw = float(params["yaw"])
-                        except (TypeError, ValueError):
-                            requested_yaw = None
-                        if requested_yaw not in YAW_CHOICES:
-                            raise ValueError(f"yaw 只能是 {', '.join(f'{c:g}' for c in YAW_CHOICES)}")
-                        new_yaw = requested_yaw
+                        raise ValueError("視角 yaw / pitch 以「視角糾正」物品上的 Selected 值為準，無法從 Discord 設定")
                     for key, caster in (("plot", int), ("x_min", int), ("x_max", int), ("y", float), ("z", float), ("radius", int)):
                         if params.get(key) is not None:
                             new_target[key] = caster(params[key])
@@ -1474,6 +1886,7 @@ def 換衣櫥(目標, 移動已停止=False):
         # The clicked wardrobe button represents the complete loadout.
         裝備套裝 = 目標狀態
         _lifecycle["loadout"] = 目標狀態
+        _write_watchdog_state(loadout=目標狀態, loadout_at=time.time())
         echo(f"✅ 衣櫥 {目標} 點擊已送出，套裝狀態記為 {目標}")
         return True
     finally:
@@ -1596,9 +2009,18 @@ def 傳回農田初始點():
         停止移動("傳回初始點完成位移")
 
         # 使用安全的視角糾正物品校正朝向，並設逾時避免卡在迴圈。
-        if not 校正農田視角():
-            停止移動("回農田視角校正逾時")
-            echo("視角校正逾時，取消回農田流程")
+        校正成功 = False
+        for _校正次 in range(ANTI_FAIL_CORRECT_MAX_FAILS):
+            if _stop_event.is_set() or not 開關 or 害蟲處理中 or anti_fail_hold.is_set():
+                停止移動("回農田視角校正中止")
+                return
+            if 校正農田視角():
+                校正成功 = True
+                break
+            echo(f"§e回農田視角校正失敗（{_校正次 + 1}/{ANTI_FAIL_CORRECT_MAX_FAILS}），重試")
+        if not 校正成功:
+            停止移動("回農田視角校正失敗")
+            啟動防故障暫停("回農田後視角連續校正失敗，已停止以免低頭挖土")
             return
 
         停止移動("回農田流程完成校正")
@@ -1648,6 +2070,11 @@ def farming_move():
             if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set():
                 continue
 
+            if not 農田朝向正確():
+                echo("§e[挖田] 視角 yaw/pitch 不正確，暫不挖掘，等待視角糾正")
+                等(0.3)
+                continue
+
             左鍵(True)
             flush()
             _farm_attack_monitor_active.set()
@@ -1676,6 +2103,11 @@ def farming_move():
                     if not isinstance(hand, dict) or hand.get("slot") != HOE:
                         停止移動("挖田途中主手不再是 HOE")
                         echo("§c主手不是 HOE 或讀取失敗，停止移動以免空走或破壞作物")
+                        hoe_lost = True
+                        break
+                    if not 農田朝向正確():
+                        停止移動("挖田途中視角偏離")
+                        echo("§c視角 yaw/pitch 偏離，停止挖掘等待糾正")
                         hoe_lost = True
                         break
                     next_hoe_check = now + random.uniform(0.55, 0.8)
@@ -1971,11 +2403,22 @@ def equipment_monitor():
 # ─────────────────────────────────────────────
 def 合成地獄疙瘩():
     """依序批量合成 MUTANT_NETHER_STALK 與 ENCHANTED_NETHER_STALK。"""
-    recipes = ("MUTANT_NETHER_STALK", "ENCHANTED_NETHER_STALK")
+    return 合成作物(CROP_COMPACT_CONFIG[0]["recipes"])
 
-    for recipe in recipes:
+
+def 合成作物(recipes):
+    """依序（高階 → 低階）合成；recipes 為 (配方ID, 原料名稱) 清單。
+
+    每個配方開介面前先確認背包原料 >= 160，不足就跳過，不白開 /viewrecipe。
+    """
+    for recipe, ingredient in recipes:
         if _stop_event.is_set():
             return False
+
+        have = _count_inventory_item(get_all_slots(timeout=0.8), ingredient)
+        if have < CROP_COMPACT_INGREDIENT_COUNT:
+            echo(f"略過 {recipe}：{ingredient} 只有 {have} 個（需要 {CROP_COMPACT_INGREDIENT_COUNT}）")
+            continue
 
         echo(f"開始批量合成：{recipe}")
         開啟介面指令(f"/viewrecipe {recipe}")
@@ -2119,28 +2562,20 @@ def inventory_sell_monitor():
             if count >= threshold:
                 bazaar_counts[name] = count
 
-        nether_wart_count = sum(
-            slot.get("count", 0)
-            for slot in inventory_slots
-            if slot.get("count", 0) > 0
-            and (
-                "nether wart" in str(slot.get("name", "")).casefold()
-                or "nether_wart" in str(slot.get("id", "")).casefold()
-            )
-            and not re.search(
-                r"\bhoe\b",
-                str(slot.get("name", "")) + " " + str(slot.get("id", "")),
-                flags=re.IGNORECASE,
-            )
-        )
+        crop_to_compact = None
+        crop_compact_count = 0
+        for crop_config in CROP_COMPACT_CONFIG:
+            score = _craftable_crop_score(crop_config, inventory_slots)
+            if score > crop_compact_count:
+                crop_to_compact, crop_compact_count = crop_config, score
 
-        if nether_wart_count >= NETHER_WART_COMPACT_THRESHOLD:
+        if crop_to_compact is not None:
             with action_lock:
                 if _stop_event.is_set():
                     return
-                echo(f"背包 Nether Wart 共 {nether_wart_count} 個，達到 {NETHER_WART_COMPACT_THRESHOLD} 個，開始壓縮")
-                停止移動("Nether Wart 批量合成開始")
-                合成地獄疙瘩()
+                echo(f"背包 {crop_to_compact['name']} 有足夠原料可壓縮（可合成原料共 {crop_compact_count} 個），開始壓縮")
+                停止移動(f"{crop_to_compact['name']} 批量合成開始")
+                合成作物(crop_to_compact["recipes"])
                 close_gui(resume_attack=False)
 
                 hand = get_main_hand_item()
@@ -2151,6 +2586,7 @@ def inventory_sell_monitor():
                     and not 害蟲處理中
                     and isinstance(hand, dict)
                     and hand.get("slot") == HOE
+                    and 農田朝向正確()
                 ):
                     左鍵(True)
                     flush()
@@ -2194,6 +2630,7 @@ def inventory_sell_monitor():
                         and not 害蟲處理中
                         and isinstance(hand, dict)
                         and hand.get("slot") == HOE
+                        and 農田朝向正確()
                     ):
                         左鍵(True)
                         flush()
@@ -2308,6 +2745,7 @@ def inventory_sell_monitor():
                 and not 害蟲處理中
                 and isinstance(hand, dict)
                 and hand.get("slot") == HOE
+                and 農田朝向正確()
             ):
                 左鍵(True)
                 flush()
@@ -2510,6 +2948,9 @@ def main():
         _write_watchdog_state(f8=False, run_started_at=_run_started_at, run_deadline_at=_run_deadline_at)
 
     停止移動("主程式初始化")
+    if not _sync_target_from_item(timeout=5.0):
+        echo("§e[視角] 5 秒內讀不到糾正物品的 Selected Yaw/Pitch，暫用上次記錄值")
+    echo(_view_settings_text())
 
     if _stop_event.is_set():
         return

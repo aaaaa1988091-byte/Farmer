@@ -6,76 +6,22 @@ from __future__ import annotations
 import json
 import os
 import queue
-import sys
 import socket
 import time
 import threading
 import builtins
+import re
 from pathlib import Path
+
+import minescript as m
+from system.lib.java import eval_pyjinn_script as eps
 
 from system.lib.minescript import EventQueue, EventType, echo, execute
 
 
 ROOT = Path(__file__).resolve().parent
-
-_CMD_CACHE = {}
-
-
-def _minescript_command(name):
-    """找出 name.py 實際位置，回傳相對 minescript 指令目錄的指令名稱（如 \\sub/name）。找不到就退回 \\name。"""
-    if name in _CMD_CACHE:
-        return _CMD_CACHE[name]
-    filename = name + ".py"
-
-    starts = []
-    try:
-        starts.append(os.path.dirname(os.path.abspath(__file__)))
-    except NameError:
-        pass
-    try:
-        if sys.argv and sys.argv[0]:
-            starts.append(os.path.dirname(os.path.abspath(sys.argv[0])))
-    except Exception:
-        pass
-    starts.append(os.getcwd())
-
-    def find_root(path):
-        cur = os.path.abspath(path)
-        while True:
-            if os.path.basename(cur).lower() == "minescript":
-                return cur
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                return None
-            cur = parent
-
-    result = None
-    for start in starts:
-        root = find_root(start) or start
-        candidates = []
-        if os.path.isfile(os.path.join(start, filename)):
-            candidates.append(start)
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in ("__pycache__", "system") and not d.startswith(".")
-            ]
-            if filename in filenames:
-                candidates.append(dirpath)
-        if not candidates:
-            continue
-        best = min(candidates, key=lambda p: os.path.relpath(p, root).count(os.sep))
-        rel = os.path.relpath(best, root).replace(os.sep, "/")
-        result = "\\" + (name if rel == "." else f"{rel}/{name}")
-        break
-
-    if result is None:
-        result = "\\" + name
-    _CMD_CACHE[name] = result
-    return result
-
-
 STATE_FILE = ROOT / "Farm_watchdog_state.json"
+BAN_STATE_FILE = ROOT / "Hypixel_ban_state.json"
 STOP_FILE = ROOT / "Farm_watchdog.stop"
 LOCK_FILE = ROOT / ".farm_watchdog.lock"
 CONTROL_HOST = "127.0.0.1"
@@ -193,7 +139,7 @@ def _process_discord_restart_queue() -> None:
             temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             os.replace(temporary, STATE_FILE)
             echo(f"§eDiscord 遠端重啟 Farm.py；恢復 F8={resume_f8}")
-            execute(_minescript_command("Farm"))
+            execute("\\\\FarmBot/Farm")
             pending["result"] = {
                 "ok": True,
                 "message": "Watchdog 已送出 Farm.py 啟動指令；"
@@ -229,45 +175,285 @@ def write_restart_marker(health: dict | None, resume_f8: bool) -> None:
     os.replace(temporary, STATE_FILE)
 
 
+
+# ===== Hypixel ban-screen countdown (owned by the persistent Watchdog) =====
+BAN_F10_KEY = 299
+BAN_POLL_INTERVAL = 0.01
+BAN_STATE_POLL_INTERVAL = 0.10
+BAN_ADMIN_IDS = {1554407173981737045, 999062030101254256}
+_DURATION_TOKEN_RE = re.compile(r"(\d+)\s*([dhms])", re.IGNORECASE)
+_DURATION_FULL_RE = re.compile(r"\s*\d+\s*[dhms](?:\s+\d+\s*[dhms])*\s*", re.IGNORECASE)
+_BAN_DEADLINE_AT: float | None = None
+_BAN_STATE_MTIME_NS: int | None = None
+_BAN_NEXT_STATE_POLL = 0.0
+_BAN_LOCAL_PAUSED = False  # F10 暫停攔截；不刪除 Discord 設定的截止時間
+
+
+def parse_ban_duration(value: str) -> int:
+    """Parse `1145d 15h`; also tolerate the command's visible `time:` label."""
+    if not isinstance(value, str):
+        raise ValueError("時間格式錯誤。請使用例如：1145d 15h 或 29d 17h 34m 51s")
+
+    value = value.strip()
+    # Discord displays this as the parameter name. Accept it if it was copied
+    # into the value, but do not require users to type it.
+    value = re.sub(r"^(?:/hypixel_ban\s+)?time\s*:\s*", "", value, flags=re.IGNORECASE)
+    if not _DURATION_FULL_RE.fullmatch(value):
+        raise ValueError("時間格式錯誤。請使用例如：1145d 15h 或 29d 17h 34m 51s")
+
+    units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    seen: set[str] = set()
+    total = 0
+    for amount_text, unit_text in _DURATION_TOKEN_RE.findall(value):
+        unit = unit_text.lower()
+        if unit in seen:
+            raise ValueError(f"時間單位 {unit} 重複，請每個單位只填一次。")
+        seen.add(unit)
+        total += int(amount_text) * units[unit]
+
+    if total <= 0:
+        raise ValueError("倒數時間必須大於 0。")
+    return total
+
+
+def format_ban_duration(seconds: float) -> str:
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, secs = divmod(remaining, 60)
+    return f"{days}d {hours}h {minutes}m {secs}s"
+
+
+def save_ban_deadline(duration_text: str, seconds: int, user_id: int) -> float:
+    """Persist an absolute deadline; the Watchdog loop owns all game actions."""
+    global _BAN_DEADLINE_AT, _BAN_STATE_MTIME_NS, _BAN_NEXT_STATE_POLL, _BAN_LOCAL_PAUSED
+    _BAN_LOCAL_PAUSED = False
+    now = time.time()
+    deadline = now + int(seconds)
+    state = {
+        "deadline_at": deadline,
+        "duration_text": duration_text,
+        "created_at": now,
+        "created_by": int(user_id),
+    }
+    temporary = BAN_STATE_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, BAN_STATE_FILE)
+
+    # Discord runs on its own thread. Publish the new deadline immediately,
+    # while leaving mtime unset so the next Watchdog tick marks it as changed
+    # and performs the first Hypixel-only disconnect if already connected.
+    _BAN_DEADLINE_AT = deadline
+    _BAN_STATE_MTIME_NS = None
+    _BAN_NEXT_STATE_POLL = 0.0
+    return deadline
+
+
+def clear_ban_deadline() -> None:
+    global _BAN_DEADLINE_AT, _BAN_STATE_MTIME_NS
+    _BAN_DEADLINE_AT = None
+    _BAN_STATE_MTIME_NS = None
+    try:
+        BAN_STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        echo(f"§c無法清除 Hypixel 倒數狀態：{exc}")
+
+
+def _load_ban_deadline_if_changed() -> bool:
+    'Reload the absolute deadline only when its persisted file changes.'
+    global _BAN_DEADLINE_AT, _BAN_STATE_MTIME_NS
+    try:
+        stat = BAN_STATE_FILE.stat()
+        if _BAN_STATE_MTIME_NS == stat.st_mtime_ns:
+            return False
+        state = json.loads(BAN_STATE_FILE.read_text(encoding="utf-8"))
+        deadline = float(state["deadline_at"])
+        if deadline <= 0:
+            raise ValueError("invalid deadline")
+        _BAN_DEADLINE_AT = deadline
+        _BAN_STATE_MTIME_NS = stat.st_mtime_ns
+        echo(f"§eHypixel 倒數已載入：{format_ban_duration(deadline - time.time())}")
+        return True
+    except FileNotFoundError:
+        changed = _BAN_DEADLINE_AT is not None or _BAN_STATE_MTIME_NS is not None
+        _BAN_DEADLINE_AT = None
+        _BAN_STATE_MTIME_NS = None
+        return changed
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        echo(f"§cHypixel 倒數狀態讀取失敗：{type(exc).__name__}: {exc}")
+        return False
+
+
+def _disconnect_from_hypixel(remaining_seconds: float) -> bool:
+    """Poll Minecraft directly through Pyjinn and disconnect only from Hypixel."""
+    countdown = format_ban_duration(remaining_seconds)
+    script = r"""
+mc = JavaClass("net.minecraft.client.Minecraft").getInstance()
+server = mc.getCurrentServer()
+result = False
+
+if server is not None and server.ip is not None:
+    address = str(server.ip).lower().strip()
+    host = address.split(":")[0].rstrip(".")
+
+    if host == "hypixel.net" or host.endswith(".hypixel.net"):
+        Component = JavaClass("net.minecraft.network.chat.Component")
+        Formatting = JavaClass("net.minecraft.ChatFormatting")
+        line1 = Component.literal("You are temporarily banned for ").withColor(0xFF5555)
+        line1 = line1.append(Component.literal("__COUNTDOWN__").withColor(0xFFFFFF))
+        line1 = line1.append(Component.literal(" from this server!").withColor(0xFF5555))
+        line2 = Component.literal(
+            "Reason: Your account's security appeal was processed and the account "
+            "has entered a recovery phase and will be able to access the server "
+            "again after 30 days. Use this time to change passwords, emails and "
+            "security questions."
+        ).withColor(0xFFFFFF)
+        line3 = Component.literal("Find out more: ").withColor(0xAAAAAA)
+        url = Component.literal("https://www.hypixel.net/appeal").withColor(0x55FFFF).withStyle(Formatting.UNDERLINE)
+        line3 = line3.append(url)
+        message = Component.literal("")
+        message = message.append(line1)
+        message = message.append(Component.literal("\n"))
+        message = message.append(line2)
+        message = message.append(Component.literal("\n"))
+        message = message.append(line3)
+        connection = mc.getConnection()
+        if connection is not None and connection.getConnection() is not None:
+            connection.getConnection().disconnect(message)
+            result = True
+result
+""".replace("__COUNTDOWN__", countdown)
+    try:
+        return bool(eps(script))
+    except Exception as exc:
+        echo(f"§cHypixel 斷線畫面執行失敗：{type(exc).__name__}: {exc}")
+        return False
+
+
+def watchdog_ban_tick(force_disconnect: bool = False) -> None:
+    'Maintain the deadline independently of Farm.py/test.py.'
+    global _BAN_NEXT_STATE_POLL
+    now_mono = time.monotonic()
+    changed = False
+    if now_mono >= _BAN_NEXT_STATE_POLL:
+        _BAN_NEXT_STATE_POLL = now_mono + BAN_STATE_POLL_INTERVAL
+        changed = _load_ban_deadline_if_changed()
+
+    deadline = _BAN_DEADLINE_AT
+    if deadline is None:
+        return
+    if _BAN_LOCAL_PAUSED:
+        return
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        clear_ban_deadline()
+        echo("§aHypixel 倒數已結束，停止攔截 Hypixel 連線")
+        return
+
+    # 不等待 WORLD 事件：每個 0.01 秒主迴圈都透過 Pyjinn
+    # 直接查詢 Minecraft.getCurrentServer()，加入伺服器後立即判斷。
+    if _disconnect_from_hypixel(remaining):
+        echo(f"§eHypixel 倒數攔截已執行：{format_ban_duration(remaining)}")
+
+
 def run_watchdog() -> None:
     if not CONTROL_SECRET:
         echo("§cFarm watchdog 未啟動：.env 缺少 FARMBOT_CONTROL_SECRET")
         return
 
     start_embedded_discord_bot()
+    started_wall = time.time()
     connected = True  # 由 Farm.py 啟動時，Minecraft 當下已連線至世界。
     next_check_at = time.monotonic() + RECONNECT_GRACE_SECONDS
     failed_checks = 0
     last_f8 = False
     last_health: dict | None = None
+    health_job: dict | None = None      # 背景 health 檢查，避免 socket timeout 卡住 ban 偵測
+    next_stop_check = 0.0
     echo("Farm watchdog 已啟動，將在跨服重連後檢查 Farm.py socket")
+    watchdog_ban_tick(force_disconnect=True)  # 重啟 Watchdog 後恢復已保存的絕對截止時間
 
     with EventQueue() as events:
         events.register_world_listener()
+        events.register_key_listener()   # Farm.py 沒回應時，F9 也要能關掉 watchdog + Discord
         while True:
+            _t = time.monotonic()
+            if _t >= next_stop_check:
+                next_stop_check = _t + 0.25
+                if stop_requested(started_wall):
+                    shutdown_everything("F9")
+                    return
             _process_discord_restart_queue()
             try:
-                event = events.get(timeout=0.5)
+                event = events.get(timeout=BAN_POLL_INTERVAL)
             except queue.Empty:
                 event = None
 
+            if (
+                event is not None
+                and event.type == EventType.KEY
+                and event.action == 1
+                and event.key == BAN_F10_KEY
+            ):
+                global _BAN_LOCAL_PAUSED
+                _BAN_LOCAL_PAUSED = not _BAN_LOCAL_PAUSED
+                if _BAN_LOCAL_PAUSED:
+                    echo("§eF10：暫時暫停 Hypixel 攔截；倒數仍持續，重新按 F10 可恢復")
+                else:
+                    echo("§aF10：已恢復 Hypixel 攔截")
+                    watchdog_ban_tick(force_disconnect=True)
+                continue
+
+            if (
+                event is not None
+                and event.type == EventType.KEY
+                and event.action == 0
+                and event.key == 298
+            ):
+                try:
+                    STOP_FILE.write_text(str(time.time()), encoding="utf-8")
+                except OSError:
+                    pass
+                shutdown_everything("F9")
+                return
 
             if event is not None and event.type == EventType.WORLD:
                 connected = bool(event.connected)
                 failed_checks = 0
+                health_job = None
                 if connected:
+                    watchdog_ban_tick(force_disconnect=True)
                     next_check_at = time.monotonic() + RECONNECT_GRACE_SECONDS
                     echo("Farm watchdog 偵測到世界連線，等待載入後檢查 Farm.py")
                 else:
                     echo("Farm watchdog 偵測到離開世界，等待重新連線")
                 continue
 
+            watchdog_ban_tick()
             now = time.monotonic()
-            if not connected or now < next_check_at:
-                continue
-            next_check_at = now + POLL_SECONDS
 
-            health = request_health()
+            if health_job is None:
+                if not connected or now < next_check_at:
+                    continue
+                next_check_at = now + POLL_SECONDS
+                job = {"done": False, "result": None}
+
+                def _health_worker(box=job) -> None:
+                    try:
+                        box["result"] = request_health()
+                    finally:
+                        box["done"] = True
+
+                threading.Thread(target=_health_worker, name="FarmBot-Health", daemon=True).start()
+                health_job = job
+                continue
+
+            if not health_job["done"]:
+                continue
+            health = health_job["result"]
+            health_job = None
             if health is not None:
                 last_health = health
                 if "f8" in health:
@@ -303,12 +489,27 @@ def run_watchdog() -> None:
             try:
                 write_restart_marker(last_health, resume_f8=True)
                 echo("§eFarm.py socket 連續無回應，重新啟動 Farm.py 並恢復 F8")
-                execute(_minescript_command("Farm"))
+                execute("\\FarmBot/Farm")
                 failed_checks = 0
                 next_check_at = time.monotonic() + RECONNECT_GRACE_SECONDS
             except Exception as exc:
                 echo(f"§cFarm watchdog 重啟 Farm.py 失敗：{type(exc).__name__}: {exc}")
                 next_check_at = time.monotonic() + 10.0
+
+
+def stop_requested(since_wall: float) -> bool:
+    """F9 會寫入 Farm_watchdog.stop（內容為時間戳）；只認本次啟動之後寫入的。"""
+    try:
+        stamp = float(STOP_FILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return stamp >= since_wall - 1.0
+
+
+def shutdown_everything(reason: str) -> None:
+    """F9：關閉 watchdog 並一併關閉 Discord bot。"""
+    echo(f"§c{reason}：Farm watchdog 與 Discord bot 即將關閉")
+    stop_embedded_discord_bot()
 
 
 def main() -> None:
@@ -422,6 +623,43 @@ async def is_authorized(interaction: discord.Interaction) -> bool:
     return True
 
 
+@bot.tree.command(name="hypixel_ban_stop", description="遠端停止 Hypixel 斷線倒數")
+async def hypixel_ban_stop(interaction: discord.Interaction) -> None:
+    if interaction.user.id not in BAN_ADMIN_IDS:
+        await interaction.response.send_message("你沒有使用此指令的權限。", ephemeral=True)
+        return
+
+    clear_ban_deadline()
+    global _BAN_LOCAL_PAUSED
+    _BAN_LOCAL_PAUSED = False
+    await interaction.response.send_message(
+        "已遠端停止 Hypixel 倒數攔截，並清除保存的截止時間。"
+    )
+
+
+@bot.tree.command(name="hypixel_ban", description="設定 Hypixel 斷線倒數")
+@app_commands.rename(duration="time")
+@app_commands.describe(duration="倒數時間，例如 1145d 15h 或 29d 17h 34m 51s")
+async def hypixel_ban(interaction: discord.Interaction, duration: str) -> None:
+    if interaction.user.id not in BAN_ADMIN_IDS:
+        await interaction.response.send_message("你沒有使用此指令的權限。", ephemeral=True)
+        return
+
+    try:
+        seconds = parse_ban_duration(duration)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    deadline = save_ban_deadline(duration, seconds, interaction.user.id)
+    await interaction.response.send_message(
+        f"Hypixel 倒數已設定：`{format_ban_duration(seconds)}`\n"
+        f"截止時間：`<t:{int(deadline)}:F>`\n"
+        "Watchdog 會獨立維護倒數；F10 可解除攔截。",
+        ephemeral=True,
+    )
+
+
 def _discord_log(message: str) -> None:
     print(message)
     try:
@@ -503,27 +741,6 @@ async def farm_add_time(interaction: discord.Interaction, minutes: app_commands.
     )
 
 
-@bot.tree.command(name="farm_yaw", description="選擇視角校正的目標 yaw（會存入 json）")
-@app_commands.describe(yaw="目標 yaw")
-@app_commands.choices(
-    yaw=[
-        app_commands.Choice(name="180（預設）", value=180),
-        app_commands.Choice(name="90", value=90),
-        app_commands.Choice(name="0", value=0),
-        app_commands.Choice(name="-90", value=-90),
-    ]
-)
-async def farm_yaw(interaction: discord.Interaction, yaw: app_commands.Choice[int]) -> None:
-    if not await is_authorized(interaction):
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    result = await asyncio.to_thread(request_farm, "set_view", yaw=yaw.value)
-    await interaction.followup.send(
-        result.get("message", result.get("error", "操作失敗")),
-        ephemeral=True,
-    )
-
-
 @bot.tree.command(name="farm_return_target", description="設定回程 AOTV 目標點（存入 json；不填任何參數則顯示目前值）")
 @app_commands.describe(
     plot="回程先傳送到的 Plot（1 到 24，預設 13）",
@@ -577,7 +794,6 @@ PANEL_FEATURES = (
     ("spray", "噴霧"),
     ("bonus", "Bonus"),
 )
-PANEL_YAWS = (180, 90, 0, -90)
 
 
 async def fetch_panel() -> tuple[dict | None, str | None]:
@@ -622,7 +838,10 @@ def build_panel_embed(info: dict | None, error: str | None = None) -> discord.Em
     embed.add_field(
         name="視角／回程",
         value=(
-            f"yaw {info.get('yaw'):g} · Plot {target.get('plot')} · "
+            f"yaw {info.get('yaw'):g} / pitch "
+            + (f"{info.get('pitch'):g}" if info.get("pitch") is not None else "?")
+            + (" (糾正物品)" if info.get("view_live") else " (上次記錄)")
+            + f" · Plot {target.get('plot')} · "
             + (f"瞄準 {target['block']}（r={target.get('radius')}）" if target.get("block") else "座標瞄準")
         ) if info.get("yaw") is not None else "—",
         inline=True,
@@ -639,22 +858,6 @@ class PanelButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await panel_dispatch(interaction, self.key)
-
-
-class YawSelect(discord.ui.Select):
-    def __init__(self, current: float | None) -> None:
-        options = [
-            discord.SelectOption(
-                label=f"視角校正 yaw {value}",
-                value=str(value),
-                default=current is not None and float(current) == float(value),
-            )
-            for value in PANEL_YAWS
-        ]
-        super().__init__(placeholder="視角校正目標 yaw", options=options, custom_id="farmpanel:yaw", row=3)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await panel_dispatch(interaction, "yaw", value=int(self.values[0]))
 
 
 class PanelView(discord.ui.View):
@@ -676,7 +879,6 @@ class PanelView(discord.ui.View):
         self.add_item(PanelButton("antifail", "解除 Anti-Fail", S.secondary, 2))
         self.add_item(PanelButton("add30", "加時 30 分", S.secondary, 2))
         self.add_item(PanelButton("health", "蟲血量", S.secondary, 2))
-        self.add_item(YawSelect(info.get("yaw")))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await is_authorized(interaction)
@@ -737,8 +939,6 @@ async def panel_dispatch(interaction: discord.Interaction, key: str, value=None)
         result = await asyncio.to_thread(request_farm, "resume_anti_fail")
     elif key == "add30":
         result = await asyncio.to_thread(request_farm, "add_time", minutes=30)
-    elif key == "yaw":
-        result = await asyncio.to_thread(request_farm, "set_view", yaw=value)
 
     if key == "restart":
         await asyncio.sleep(2.5)   # 新 job 需要一點時間開 socket
@@ -835,6 +1035,10 @@ def acquire_discord_single_instance_lock():
 
 
 
+_DISCORD_LOOP = None
+_DISCORD_THREAD = None
+
+
 def start_embedded_discord_bot() -> None:
     """Start the original discord_control bot under the Watchdog process."""
     if not BOT_TOKEN:
@@ -846,10 +1050,16 @@ def start_embedded_discord_bot() -> None:
 
     def discord_worker() -> None:
         import traceback
+
+        async def run_bot() -> None:
+            global _DISCORD_LOOP
+            _DISCORD_LOOP = asyncio.get_running_loop()
+            await bot.start(BOT_TOKEN)
+
         try:
             # Keep the original Bot, commands and event handlers.
             # bot.run() installs signal handlers and expects the main thread.
-            asyncio.run(bot.start(BOT_TOKEN))
+            asyncio.run(run_bot())
         except BaseException as exc:
             message = f"Discord Bot 執行失敗：{type(exc).__name__}: {exc}"
             print(message)
@@ -860,7 +1070,29 @@ def start_embedded_discord_bot() -> None:
             except OSError:
                 pass
 
-    threading.Thread(target=discord_worker, name="FarmBot-Discord", daemon=True).start()
+    global _DISCORD_THREAD
+    _DISCORD_THREAD = threading.Thread(target=discord_worker, name="FarmBot-Discord", daemon=True)
+    _DISCORD_THREAD.start()
+
+
+def stop_embedded_discord_bot() -> None:
+    """Gracefully close the Discord bot (used by F9 only)."""
+    loop = _DISCORD_LOOP
+    if loop is not None and loop.is_running():
+        async def _close() -> None:
+            try:
+                if periodic_report.is_running():
+                    periodic_report.cancel()
+            finally:
+                await bot.close()
+        try:
+            asyncio.run_coroutine_threadsafe(_close(), loop).result(timeout=10)
+        except Exception as exc:
+            _discord_log(f"關閉 Discord bot 失敗：{type(exc).__name__}: {exc}")
+    thread = _DISCORD_THREAD
+    if thread is not None:
+        thread.join(timeout=5.0)
+    echo("Discord bot 已關閉")
 
 
 if __name__ == "__main__":
