@@ -111,9 +111,36 @@ except Exception as e:
 
 # 記錄上一條最新訊息的 Java 物件，用物件位址比對是否有新訊息
 last_msg_obj = None
+frame_count = 0
+dead = False
+listener_id = None
 
 def check_chat(_):
-    global last_msg_obj
+    global last_msg_obj, frame_count, dead
+    # 連線不存在（或已確認斷線）就什麼都不做，不再每幀做反射
+    if dead or not writer:
+        return
+    frame_count += 1
+    if frame_count % 120 == 0:
+        # 心跳：送空行（Python 端會忽略）。對端行程已結束時 checkError() 會變 True，
+        # 舊的渲染監聽就能自己退役，不會隨 Farm.py 每次重啟越積越多。
+        try:
+            writer.println("")
+            writer.flush()
+            if writer.checkError():
+                dead = True
+        except Exception as e0:
+            dead = True
+        if dead:
+            try:
+                bridge_socket.close()
+            except Exception as e1:
+                pass
+            try:
+                remove_event_listener(listener_id)
+            except Exception as e2:
+                pass
+            return
     try:
         if chat_field and msg_field and mc.gui and mc.gui.hud:
             chat_comp = chat_field.get(mc.gui.hud)
@@ -140,7 +167,7 @@ def check_chat(_):
     except Exception as e:
         pass
 
-add_event_listener("render", check_chat)
+listener_id = add_event_listener("render", check_chat)
 """
 
 

@@ -4,9 +4,10 @@ from pest_main import PestCleaner
 from pest_utils import look_at_block, look_at_the_block, _release_all, get_main_hand_item, check_front_crops, check_sides, player_tracker, get_current_plot, get_scoreboard_lines
 from TAB import get_tablist_info_confirmed
 from BAG import close_gui as _bag_close_gui, Find_Item, get_all_slots, click as _bag_click
-from CHAT import chatget
+from CHAT import chatget, bridge_server as _chat_bridge
 import time, threading, random, re, socket, json, subprocess, sys, hmac
 import builtins
+import collections
 import gc
 import os
 import queue
@@ -214,7 +215,7 @@ class _ItemBridge:
         self._closed = False
         self._view = None      # (yaw, pitch) 或 None（物品不在 / 讀不到）
         self._version = 0      # 每收到一份完整快照 +1
-        self.errors = []
+        self.errors = collections.deque(maxlen=20)  # 只保留最近 20 筆，避免無限增長
 
     def start(self):
         threading.Thread(target=self._listen_loop, daemon=True).start()
@@ -299,6 +300,9 @@ StandardCharsets = JavaClass("java.nio.charset.StandardCharsets")
 DataComponents = JavaClass("net.minecraft.core.component.DataComponents")
 Registry = JavaClass("net.minecraft.core.registries.BuiltInRegistries")
 mc = JavaClass("net.minecraft.client.Minecraft").getInstance()
+System = JavaClass("java.lang.System")
+my_gen = str(""" + str(port) + r""")
+System.setProperty("farmbot.item_bridge_gen", my_gen)
 
 writer = None
 try:
@@ -370,6 +374,18 @@ def check_items(_):
     if frame_count % 20 != 0:
         return
     try:
+        if str(System.getProperty("farmbot.item_bridge_gen")) != my_gen:
+            # 已有較新的 Farm.py 注入了新的橋：本監聽退役，釋放連線並嘗試移除自己
+            dead = True
+            try:
+                writer.close()
+            except Exception as e0:
+                pass
+            try:
+                remove_event_listener(listener_id)
+            except Exception as e1:
+                pass
+            return
         if not mc.player:
             return
         lines = build_lines()
@@ -392,7 +408,8 @@ def check_items(_):
             except Exception as e2:
                 pass
 
-add_event_listener("render", check_items)
+listener_id = None
+listener_id = add_event_listener("render", check_items)
 """.replace("__SLOT__", str(int(slot)))
 
 
@@ -488,6 +505,75 @@ CROP_COMPACT_CONFIG = (
         ("ENCHANTED_SUGAR_CANE", "Enchanted Sugar"),
         ("ENCHANTED_SUGAR", "Sugar Cane"))},
 )
+
+
+# ===== Hypixel 伺服器排程重啟偵測 =====
+# 離開 Garden 絕大多數是因為伺服器重啟：先有 "This server will restart soon" 預警（約 60 秒），
+# 重啟時伺服器會顯示 "Evacuating to Hub..." 把玩家送去 Hub。直接聽聊天室，不必等 Area 讀數。
+# 時間用牆上時間記錄，Farm.py 自重啟後也能接續。
+REBOOT_WARN_WINDOW_SECONDS = 150.0       # 預警後多久內視為「即將重啟」
+EVAC_WINDOW_SECONDS = 90.0               # 撤離訊息後多久內視為「已被撤離、尚未回到 Garden」
+EVAC_GARDEN_LEAVE_CONFIRM_SECONDS = 1.0  # 撤離中：確認離開 Garden 只需 1 秒就 /warp garden（平常 3 秒）
+_reboot_state = {"warned_at": 0.0, "evac_at": 0.0}
+
+
+def _reboot_imminent():
+    """已收到重啟預警、且尚未被撤離。除蟲這類長流程此時不要開始。"""
+    warned = _reboot_state["warned_at"]
+    return warned > 0 and time.time() - warned < REBOOT_WARN_WINDOW_SECONDS and _reboot_state["evac_at"] < warned
+
+
+def _evacuating():
+    """剛被伺服器撤離、尚未確認回到新的 Garden。流程應立刻放棄並讓出 action_lock。"""
+    evac = _reboot_state["evac_at"]
+    return evac > 0 and time.time() - evac < EVAC_WINDOW_SECONDS
+
+
+def _note_chat_for_reboot(message):
+    text = re.sub(r"§.", "", str(message or "")).lower()
+    now = time.time()
+    if "this server will restart soon" in text:
+        if not _reboot_imminent():
+            echo("§e[重啟預警] 伺服器即將排程重開，暫停開始新的除蟲流程")
+        _reboot_state["warned_at"] = now
+    elif "evacuating to hub" in text:
+        _reboot_state["evac_at"] = now
+        echo("§e[重啟] 伺服器正在撤離玩家到 Hub，放棄進行中的回位／校正，改走返回 Garden 流程")
+    else:
+        return
+    try:
+        _write_watchdog_state(reboot_warned_at=_reboot_state["warned_at"], reboot_evac_at=_reboot_state["evac_at"])
+    except Exception:
+        pass
+
+
+def 重啟偵測():
+    """常駐訂閱 CHAT 橋（UTF-8 安全，不碰 Minescript 原生文字讀取），
+    看到伺服器重啟預警／撤離訊息就設定旗標。chatget 每次只等一小段時間，呼叫之間的訊息會漏，
+    所以這裡直接訂閱橋的佇列持續讀。"""
+    echo("伺服器重啟偵測 Thread 啟動")
+    q = _chat_bridge.subscribe()
+    try:
+        while not _stop_event.is_set():
+            try:
+                message = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            _note_chat_for_reboot(message)
+    finally:
+        _chat_bridge.unsubscribe(q)
+
+
+def _clear_reboot_state_if_back_in_garden():
+    """撤離之後又確認回到 Garden：清掉旗標（撤離訊息後 8 秒內不清，避免舊伺服器 Area 還沒變時誤清）。"""
+    evac = _reboot_state["evac_at"]
+    if evac > 0 and time.time() - evac > 8.0:
+        _reboot_state["warned_at"] = 0.0
+        _reboot_state["evac_at"] = 0.0
+        try:
+            _write_watchdog_state(reboot_warned_at=0.0, reboot_evac_at=0.0)
+        except Exception:
+            pass
 
 
 CROP_RECIPE_FAIL_COOLDOWN_SECONDS = 600.0
@@ -663,6 +749,15 @@ try:
             _remaining = float(_until_wall) - _now_wall
             if 0 < _remaining <= CROP_RECIPE_FAIL_COOLDOWN_SECONDS:
                 _crop_recipe_fail_until[str(_recipe_id)] = _now_mono + _remaining
+except (TypeError, ValueError):
+    pass
+
+# 還原伺服器重啟旗標（Farm.py 在預警／撤離期間自重啟時不要失憶）
+try:
+    _rw = float(_watchdog_state.get("reboot_warned_at") or 0.0)
+    _re = float(_watchdog_state.get("reboot_evac_at") or 0.0)
+    if time.time() - max(_rw, _re) < REBOOT_WARN_WINDOW_SECONDS:
+        _reboot_state["warned_at"], _reboot_state["evac_at"] = _rw, _re
 except (TypeError, ValueError):
     pass
 
@@ -1033,7 +1128,26 @@ def 校正農田視角(timeout=8.0):
     deadline = time.time() + timeout
     target_yaw = _target_yaw
     used_item = False
+
+    # 視角已經在目標範圍內（例如 /warp garden 或回紀錄點後視角已還原）就不必再用校正物品。
+    # pitch 尚未學到時仍要用一次物品來學習；pitch 殘留的情況由下面的 pitch 容差一併排除。
+    try:
+        _ori = player_orientation()
+        if (
+            _ori
+            and _target_pitch is not None
+            and _yaw_diff(_ori[0], target_yaw) < 1.0
+            and abs(float(_ori[1]) - _target_pitch) <= CORRECT_PITCH_TOLERANCE
+        ):
+            echo("§a[視角] 視角已在目標範圍內，略過校正物品")
+            return True
+    except (TypeError, ValueError, IndexError):
+        pass
+
     while not _stop_event.is_set() and time.time() < deadline:
+        if _evacuating() or not 在花園():
+            echo("§e[視角] 目前不在 Garden（可能被傳送或伺服器重啟），中止視角校正")
+            break
         if used_item:
             orientation = player_orientation()
             if orientation and _yaw_diff(orientation[0], target_yaw) < 1.0:
@@ -1415,6 +1529,7 @@ def 回到Garden(timeout=120.0):
             if garden_since is None:
                 garden_since = now
             if now - garden_since >= GARDEN_LEAVE_CONFIRM_SECONDS:
+                _clear_reboot_state_if_back_in_garden()
                 _write_watchdog_state(recovery_stage=None)
                 if anti_fail_hold.is_set():
                     恢復防故障暫停()
@@ -1431,7 +1546,7 @@ def 回到Garden(timeout=120.0):
             none_since = None
             if outside_since is None:
                 outside_since = now
-            if now - outside_since >= GARDEN_LEAVE_CONFIRM_SECONDS and (
+            if now - outside_since >= (EVAC_GARDEN_LEAVE_CONFIRM_SECONDS if _evacuating() else GARDEN_LEAVE_CONFIRM_SECONDS) and (
                 recovery_stage != "warp_pending" or now - last_command_at >= 15.0
             ):
                 recovery_stage = "warp_pending"
@@ -1480,9 +1595,10 @@ def 回Garden監控():
                 garden_since = time.monotonic()
             if (
                 time.monotonic() - garden_since >= GARDEN_LEAVE_CONFIRM_SECONDS
-                and _read_watchdog_state().get("recovery_stage")
             ):
-                _write_watchdog_state(recovery_stage=None)
+                _clear_reboot_state_if_back_in_garden()
+                if _read_watchdog_state().get("recovery_stage"):
+                    _write_watchdog_state(recovery_stage=None)
             等(1.0)
             continue
         garden_since = None
@@ -2001,6 +2117,19 @@ def 傳回農田初始點():
             except (TypeError, ValueError, IndexError, KeyError):
                 return None
 
+        def 已離開Garden(階段):
+            """被傳到 Hub／伺服器重啟時立刻放棄回位流程並釋放 action_lock，
+            讓「回Garden監控」能取得鎖去 /warp garden。"""
+            global 農業中
+            if _test_mode_flag or (not _evacuating() and 在花園()):
+                return False
+            echo(f"§e[回農田] {階段}：偵測到已不在 Garden，中止回位並交給 Garden 返回監控")
+            停止移動("回農田流程偵測到離開 Garden")
+            _release_all()
+            if 開關 and not 害蟲處理中 and not anti_fail_hold.is_set() and not _stop_event.is_set():
+                農業中 = True   # 回到 Garden 後由作物偵測重新判斷是否需要回位
+            return True
+
         z = 目前Z()
         已抵達 = z is not None and abs(z - 目標Z) <= 到位誤差
 
@@ -2011,6 +2140,8 @@ def 傳回農田初始點():
                 停止移動("傳回初始點中止")
                 return
 
+            if 已離開Garden("回位輪次開始"):
+                return
             echo(f"回農田原點：第 {回位輪次 + 1}/{最多回位輪數} 輪，先傳送至 Plot {回程目標['plot']}")
             _release_all()
             execute(f"/tptoplot {回程目標['plot']}")
@@ -2028,6 +2159,8 @@ def 傳回農田初始點():
                     停止移動("傳回初始點中止")
                     return
 
+                if 已離開Garden("AOTV 前"):
+                    return
                 echo(f"回農田原點 AOTV：第 {本輪嘗試 + 1}/{每輪AOTV次數} 次")
                 停止移動("傳回初始點準備使用 AOTV")
                 蹲下(True)
@@ -2087,6 +2220,8 @@ def 傳回農田初始點():
             if 校正農田視角():
                 校正成功 = True
                 break
+            if 已離開Garden("視角校正"):
+                return
             echo(f"§e回農田視角校正失敗（{_校正次 + 1}/{ANTI_FAIL_CORRECT_MAX_FAILS}），重試")
         if not 校正成功:
             停止移動("回農田視角校正失敗")
@@ -2265,7 +2400,7 @@ def pest_monitor():
     echo("害蟲偵測 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or not _feature_on("pest"):
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or not _feature_on("pest") or _reboot_imminent() or _evacuating():
             等(2)
             continue
 
@@ -3047,6 +3182,7 @@ def main():
         運行計時監控,
         自動重啟監控,
         Python記憶體維護,
+        重啟偵測,
     ]
 
     control_thread = threading.Thread(target=_discord_control_server, daemon=True)
