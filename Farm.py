@@ -456,7 +456,7 @@ CROP_COMPACT_CONFIG = (
         ("MUTANT_NETHER_STALK", "Enchanted Nether Wart"),
         ("ENCHANTED_NETHER_STALK", "Nether Wart"))},
     {"name": "Wheat", "recipes": (
-        ("ENCHANTED_HAY_BLOCK", "Enchanted Wheat"),
+        ("ENCHANTED_HAY_BALE", "Enchanted Wheat"),
         ("ENCHANTED_WHEAT", "Wheat"))},
     {"name": "Seeds", "recipes": (
         ("BOX_OF_SEEDS", "Enchanted Seeds"),
@@ -490,6 +490,28 @@ CROP_COMPACT_CONFIG = (
 )
 
 
+CROP_RECIPE_FAIL_COOLDOWN_SECONDS = 600.0
+_crop_recipe_fail_until = {}  # recipe_id -> time.monotonic() 之前不再嘗試（開不出配方介面時設定）
+
+
+def _save_crop_recipe_cooldowns():
+    """把仍在冷卻中的配方存進狀態檔（以牆上時間記錄），農田自重啟後可以接續。"""
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    try:
+        _write_watchdog_state(crop_recipe_cooldowns={
+            recipe: now_wall + (until - now_mono)
+            for recipe, until in _crop_recipe_fail_until.items()
+            if until > now_mono
+        })
+    except Exception as exc:
+        echo(f"§e[合成冷卻] 無法寫入狀態檔：{type(exc).__name__}: {exc}")
+
+
+def _crop_recipe_cooling_down(recipe):
+    return time.monotonic() < _crop_recipe_fail_until.get(recipe, 0.0)
+
+
 def _count_inventory_item(slots, item_name):
     """玩家背包中名稱完全等於 item_name 的物品總數（不含 GUI 上半部槽位）。"""
     wanted = str(item_name).strip().casefold()
@@ -504,7 +526,9 @@ def _count_inventory_item(slots, item_name):
 def _craftable_crop_score(config, slots):
     """此作物所有「原料足夠」配方的原料總數；0 代表目前沒有任何可合成的配方。"""
     score = 0
-    for _recipe, ingredient in config["recipes"]:
+    for recipe, ingredient in config["recipes"]:
+        if _crop_recipe_cooling_down(recipe):
+            continue
         count = _count_inventory_item(slots, ingredient)
         if count >= CROP_COMPACT_INGREDIENT_COUNT:
             score += count
@@ -629,6 +653,18 @@ if _lifecycle.get("loadout") is None:
         _loadout_fresh = False
     if _loadout_fresh:
         _lifecycle["loadout"] = _saved_loadout
+
+# 還原配方失敗冷卻（狀態檔存的是牆上時間，換算回 monotonic）
+try:
+    _saved_cooldowns = _watchdog_state.get("crop_recipe_cooldowns")
+    if isinstance(_saved_cooldowns, dict):
+        _now_wall, _now_mono = time.time(), time.monotonic()
+        for _recipe_id, _until_wall in _saved_cooldowns.items():
+            _remaining = float(_until_wall) - _now_wall
+            if 0 < _remaining <= CROP_RECIPE_FAIL_COOLDOWN_SECONDS:
+                _crop_recipe_fail_until[str(_recipe_id)] = _now_mono + _remaining
+except (TypeError, ValueError):
+    pass
 
 
 # ─────────────────────────────────────────────
@@ -2449,6 +2485,9 @@ def 合成作物(recipes):
         if _stop_event.is_set():
             return False
 
+        if _crop_recipe_cooling_down(recipe):
+            continue
+
         have = _count_inventory_item(get_all_slots(timeout=0.8), ingredient)
         if have < CROP_COMPACT_INGREDIENT_COUNT:
             echo(f"略過 {recipe}：{ingredient} 只有 {have} 個（需要 {CROP_COMPACT_INGREDIENT_COUNT}）")
@@ -2476,9 +2515,14 @@ def 合成作物(recipes):
             等(0.15)
 
         if supercraft_slot is None:
-            echo(f"⚠️ 配方 {recipe} 介面中找不到 Supercraft，停止本輪合成")
+            echo(
+                f"⚠️ 配方 {recipe} 介面中找不到 Supercraft（ID 可能無效或配方未解鎖），"
+                f"{int(CROP_RECIPE_FAIL_COOLDOWN_SECONDS)} 秒內不再嘗試此配方，繼續下一個"
+            )
+            _crop_recipe_fail_until[recipe] = time.monotonic() + CROP_RECIPE_FAIL_COOLDOWN_SECONDS
+            _save_crop_recipe_cooldowns()
             close_gui(resume_attack=False)
-            return False
+            continue
 
         # 使用 GUI 的 Shift-click（QUICK_MOVE）切換 Supercraft 數量，不讓玩家角色蹲下。
         toggle_ok = click(supercraft_slot, shift=True)
