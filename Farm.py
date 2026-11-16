@@ -516,6 +516,14 @@ EVAC_WINDOW_SECONDS = 90.0               # 撤離訊息後多久內視為「已�
 EVAC_GARDEN_LEAVE_CONFIRM_SECONDS = 1.0  # 撤離中：確認離開 Garden 只需 1 秒就 /warp garden（平常 3 秒）
 _reboot_state = {"warned_at": 0.0, "evac_at": 0.0}
 
+# 收到重啟預警後不坐以待斃：主動 /evacuate，讓伺服器把我們送到正常的 SkyBlock Hub／Hypixel 大廳，
+# 之後走既有的「回 Garden → 回農田原點」流程（步驟不變）。
+REBOOT_EVACUATE_COMMAND = "/evacuate"
+REBOOT_EVACUATE_DELAY_RANGE = (1.0, 3.0)   # 看到預警後隨機等待幾秒再送出（模擬人的反應）
+REBOOT_EVACUATE_CHECK_SECONDS = 6.0        # 送出後等這麼久；還在 Garden 就重送
+REBOOT_EVACUATE_MAX_SENDS = 3              # 最多送幾次（再不行就等伺服器自己撤離）
+_evacuate_running = threading.Event()
+
 
 def _reboot_imminent():
     """已收到重啟預警、且尚未被撤離。除蟲這類長流程此時不要開始。"""
@@ -533,9 +541,12 @@ def _note_chat_for_reboot(message):
     text = re.sub(r"§.", "", str(message or "")).lower()
     now = time.time()
     if "this server will restart soon" in text:
-        if not _reboot_imminent():
-            echo("§e[重啟預警] 伺服器即將排程重開，暫停開始新的除蟲流程")
+        first_warning = not _reboot_imminent()
+        if first_warning:
+            echo("§e[重啟預警] 伺服器即將排程重開，準備 /evacuate 並暫停挖田相關動作")
         _reboot_state["warned_at"] = now
+        if first_warning:
+            _start_evacuation_if_needed()
     elif "evacuating to hub" in text:
         _reboot_state["evac_at"] = now
         echo("§e[重啟] 伺服器正在撤離玩家到 Hub，放棄進行中的回位／校正，改走返回 Garden 流程")
@@ -545,6 +556,42 @@ def _note_chat_for_reboot(message):
         _write_watchdog_state(reboot_warned_at=_reboot_state["warned_at"], reboot_evac_at=_reboot_state["evac_at"])
     except Exception:
         pass
+
+
+def _evacuation_worker():
+    """送出 /evacuate；確認離開 Garden 才停，否則隔幾秒重送（最多 REBOOT_EVACUATE_MAX_SENDS 次）。"""
+    try:
+        if _stop_event.wait(random.uniform(*REBOOT_EVACUATE_DELAY_RANGE)):
+            return
+        for attempt in range(1, REBOOT_EVACUATE_MAX_SENDS + 1):
+            if _stop_event.is_set() or not 開關:
+                return
+            # 先記下「正在撤離」：挖田相關流程看到旗標就立刻停手，不必等 Area 讀數變化
+            _reboot_state["evac_at"] = time.time()
+            try:
+                _write_watchdog_state(reboot_warned_at=_reboot_state["warned_at"], reboot_evac_at=_reboot_state["evac_at"])
+            except Exception:
+                pass
+            停止移動("伺服器即將重啟：撤離")
+            echo(f"§e[重啟] 送出 {REBOOT_EVACUATE_COMMAND}（第 {attempt}/{REBOOT_EVACUATE_MAX_SENDS} 次）")
+            execute(REBOOT_EVACUATE_COMMAND)
+            deadline = time.monotonic() + REBOOT_EVACUATE_CHECK_SECONDS
+            while time.monotonic() < deadline:
+                if _stop_event.wait(0.5):
+                    return
+                if not 在花園():
+                    return    # 已離開 Garden：之後交給「回Garden監控」
+        echo("§e[重啟] /evacuate 多次未離開 Garden，改等伺服器自行撤離")
+    finally:
+        _evacuate_running.clear()
+
+
+def _start_evacuation_if_needed():
+    # 只有 F8 開啟時才代為操作；手動玩（F8 關）時不碰玩家的遊戲
+    if not 開關 or _test_mode_flag or _evacuate_running.is_set() or _evacuating():
+        return
+    _evacuate_running.set()
+    threading.Thread(target=_evacuation_worker, name="FarmBot-Evacuate", daemon=True).start()
 
 
 def 重啟偵測():
@@ -976,6 +1023,7 @@ def farm_attack_monitor():
             and 農業中
             and not 害蟲處理中
             and not anti_fail_hold.is_set()
+            and _farm_actions_allowed()
         ):
             now = time.monotonic()
             if next_attack_refresh is None:
@@ -1179,11 +1227,29 @@ def 校正農田視角(timeout=8.0):
     return False
 
 
+_garden_cache = {"value": True, "at": 0.0}
+
+
 def 在花園() -> bool:
     if _test_mode_flag:
         return True
     area = get_tablist_info_confirmed("area").get("area") or ""
-    return area == "Garden"
+    result = area == "Garden"
+    _garden_cache["value"] = result
+    _garden_cache["at"] = time.monotonic()
+    return result
+
+
+def _farm_actions_allowed(max_age=2.0) -> bool:
+    """挖田相關動作的總閘門：不在 Garden（含剛下達撤離）一律不做，只剩待機或回 Garden 動作。
+    沿用最近一次 在花園() 的結果，過舊才重讀 Area，避免高頻執行緒狂讀 Tab 列表。"""
+    if _evacuating():
+        return False
+    if _test_mode_flag:
+        return True
+    if time.monotonic() - _garden_cache["at"] > max_age:
+        return 在花園()
+    return _garden_cache["value"]
 
 
 def 確認所在Plot(attempts=3):
@@ -1237,7 +1303,7 @@ def anti_fail_monitor():
 
     while not _stop_event.is_set():
         _sync_target_from_item()
-        active = 開關 and not 害蟲處理中 and not anti_fail_hold.is_set() and 在花園()
+        active = 開關 and not 害蟲處理中 and not anti_fail_hold.is_set() and not _evacuating() and 在花園()
         if not active:
             wrong_yaw_since = None
             _stop_event.wait(0.15)
@@ -2252,13 +2318,13 @@ def farming_move():
     echo("挖田移動 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園():
+        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _evacuating():
             # 背景待機時不碰按鍵，避免與其他控制流程競爭。
             等(0.2)
             continue
 
         with action_lock:
-            if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園():
+            if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _evacuating():
                 continue
 
             if get_main_hand_item().get("slot") != HOE:
@@ -2360,7 +2426,7 @@ def crop_monitor():
     無作物確認次數 = 0
 
     while not _stop_event.is_set():
-        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園():
+        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _evacuating():
             無作物確認次數 = 0
             等(0.5)
             continue
@@ -2514,7 +2580,7 @@ def equipment_monitor():
     echo("裝備切換 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or not _feature_on("equipment"):
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _evacuating() or not _feature_on("equipment"):
             等(1.0)
             continue
 
@@ -2734,6 +2800,9 @@ def inventory_sell_monitor():
     while not _stop_event.is_set():
         if not 開關 or anti_fail_hold.is_set() or not _feature_on("sell"):
             等(10)
+            continue
+        if not _farm_actions_allowed():
+            等(2)
             continue
 
         # 只有 /boostercookie 支援這裡的開啟商店後點物品出售流程。
@@ -2998,7 +3067,7 @@ def spray_monitor():
     last_attempt = 0.0
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or not _feature_on("spray"):
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _evacuating() or not _feature_on("spray"):
             等(5.0)
             continue
 
@@ -3067,7 +3136,7 @@ def bonus_續費_monitor():
     echo("Bonus 藥水續費 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or not _feature_on("bonus"):
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _evacuating() or not _feature_on("bonus"):
             等(5.0)
             continue
 
