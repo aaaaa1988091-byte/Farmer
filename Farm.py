@@ -13,7 +13,7 @@ import os
 import queue
 
 # ─────────────────────────────────────────────
-# 測試模式（單人存檔）與功能開關：可由 Discord 面板即時切換，存在 Farm_watchdog_state.json
+# 功能開關：可由 Discord 面板即時切換，存在 Farm_watchdog_state.json
 # ─────────────────────────────────────────────
 FEATURE_LABELS = {
     "pest": "除蟲",
@@ -22,33 +22,12 @@ FEATURE_LABELS = {
     "spray": "噴霧",
     "bonus": "Bonus 續費(/call)",
 }
-# 測試模式下會被自動關閉的 Hypixel 專屬功能
-HYPIXEL_ONLY_FEATURES = ("equipment", "sell", "spray", "bonus")
-# 單人存檔不存在的指令：測試模式下直接攔截，不送出（避免 Unknown command 洗版）
-HYPIXEL_ONLY_COMMANDS = {
-    "/bz", "/viewrecipe", "/recipe", "/boostercookie", "/loadout", "/call",
-    "/warp", "/setspawn", "/plottp", "/tptoplot", "/l", "/skyblock", "/pets",
-}
-_test_mode_flag = False
 _features = {}
 _manual_pest_plot = None
-_real_execute = execute
 
 
 def _feature_on(name):
     return bool(_features.get(name, True))
-
-
-def execute(command, *args, **kwargs):
-    """包住 Minescript execute：測試模式下攔截 Hypixel 專屬指令。"""
-    try:
-        head = str(command).strip().split()[0].lower()
-    except IndexError:
-        head = ""
-    if _test_mode_flag and head in HYPIXEL_ONLY_COMMANDS:
-        echo(f"§7[測試模式] 已略過 Hypixel 專屬指令 {command!r}")
-        return None
-    return _real_execute(command, *args, **kwargs)
 
 
 def click(target, button: int = 0, shift: bool = False) -> bool:
@@ -514,12 +493,12 @@ CROP_COMPACT_CONFIG = (
 REBOOT_WARN_WINDOW_SECONDS = 150.0       # 預警後多久內視為「即將重啟」
 EVAC_WINDOW_SECONDS = 90.0               # 撤離訊息後多久內視為「已被撤離、尚未回到 Garden」
 EVAC_GARDEN_LEAVE_CONFIRM_SECONDS = 1.0  # 撤離中：確認離開 Garden 只需 1 秒就 /warp garden（平常 3 秒）
-_reboot_state = {"warned_at": 0.0, "evac_at": 0.0}
+_reboot_state = {"warned_at": 0.0, "evac_at": 0.0, "left_at": 0.0}  # left_at：撤離後實際觀察到離開 Garden 的時間
 
 # 收到重啟預警後不坐以待斃：主動 /evacuate，讓伺服器把我們送到正常的 SkyBlock Hub／Hypixel 大廳，
 # 之後走既有的「回 Garden → 回農田原點」流程（步驟不變）。
 REBOOT_EVACUATE_COMMAND = "/evacuate"
-REBOOT_EVACUATE_DELAY_RANGE = (1.0, 3.0)   # 看到預警後隨機等待幾秒再送出（模擬人的反應）
+REBOOT_EVACUATE_DELAY_RANGE = (0.3, 1.0)   # 看到預警後隨機等待的秒數；重啟視窗內 /bz、/boostercookie 等指令都失效，越早撤離越好
 REBOOT_EVACUATE_CHECK_SECONDS = 6.0        # 送出後等這麼久；還在 Garden 就重送
 REBOOT_EVACUATE_MAX_SENDS = 3              # 最多送幾次（再不行就等伺服器自己撤離）
 _evacuate_running = threading.Event()
@@ -535,6 +514,18 @@ def _evacuating():
     """剛被伺服器撤離、尚未確認回到新的 Garden。流程應立刻放棄並讓出 action_lock。"""
     evac = _reboot_state["evac_at"]
     return evac > 0 and time.time() - evac < EVAC_WINDOW_SECONDS
+
+
+def _restart_window():
+    """從收到預警到確認已撤離並回到新的 Garden 為止：指令類流程（/bz、/boostercookie、/viewrecipe、衣櫥…）
+    在這段期間都會失效，挖田相關動作一律不做。"""
+    return _reboot_imminent() or _evacuating()
+
+
+def _mark_left_garden_if_evacuating():
+    """撤離中實際看到離開 Garden：之後再回到 Garden 才算撤離完成（不再靠固定秒數猜）。"""
+    if _evacuating() and _reboot_state["left_at"] < _reboot_state["evac_at"]:
+        _reboot_state["left_at"] = time.time()
 
 
 def _note_chat_for_reboot(message):
@@ -580,6 +571,7 @@ def _evacuation_worker():
                 if _stop_event.wait(0.5):
                     return
                 if not 在花園():
+                    _mark_left_garden_if_evacuating()
                     return    # 已離開 Garden：之後交給「回Garden監控」
         echo("§e[重啟] /evacuate 多次未離開 Garden，改等伺服器自行撤離")
     finally:
@@ -588,7 +580,7 @@ def _evacuation_worker():
 
 def _start_evacuation_if_needed():
     # 只有 F8 開啟時才代為操作；手動玩（F8 關）時不碰玩家的遊戲
-    if not 開關 or _test_mode_flag or _evacuate_running.is_set() or _evacuating():
+    if not 開關 or _evacuate_running.is_set() or _evacuating():
         return
     _evacuate_running.set()
     threading.Thread(target=_evacuation_worker, name="FarmBot-Evacuate", daemon=True).start()
@@ -612,11 +604,13 @@ def 重啟偵測():
 
 
 def _clear_reboot_state_if_back_in_garden():
-    """撤離之後又確認回到 Garden：清掉旗標（撤離訊息後 8 秒內不清，避免舊伺服器 Area 還沒變時誤清）。"""
+    """撤離後「確實離開過 Garden、又確認回到 Garden」才清旗標。
+    /evacuate 沒成功、人還待在舊的 Garden 時不清：伺服器還沒重啟，指令仍然失效，繼續暫停到旗標逾時。"""
     evac = _reboot_state["evac_at"]
-    if evac > 0 and time.time() - evac > 8.0:
+    if evac > 0 and _reboot_state["left_at"] >= evac:
         _reboot_state["warned_at"] = 0.0
         _reboot_state["evac_at"] = 0.0
+        _reboot_state["left_at"] = 0.0
         try:
             _write_watchdog_state(reboot_warned_at=0.0, reboot_evac_at=0.0)
         except Exception:
@@ -691,7 +685,6 @@ FARM_RUNTIME_LOG = os.path.join(_farm_log_directory, "Farm_runtime.log")
 FARM_ACTIVITY_LOG = os.path.join(_farm_log_directory, "Farm_activity.log")
 FARM_WATCHDOG_STATE = os.path.join(_farm_log_directory, "Farm_watchdog_state.json")
 FARM_WATCHDOG_STOP = os.path.join(_farm_log_directory, "Farm_watchdog.stop")
-FARM_ADMIN_LOCK = os.path.join(_farm_log_directory, "Farm_admin_lock.json")
 
 
 _SCRIPT_FOLDER_FALLBACK = "FarmBot"  # 只有在完全推算不出本檔位置時才使用
@@ -887,8 +880,11 @@ def _sanitize_features(raw):
     return features
 
 
-_test_mode_flag = bool(_watchdog_state.get("test_mode", False))
 _features = _sanitize_features(_watchdog_state.get("features"))
+if _watchdog_state.get("test_mode"):
+    # 測試模式已移除：舊狀態檔若停在測試模式，功能開關會是被它關掉的狀態，在這裡還原並清掉舊欄位。
+    _features = _sanitize_features(_watchdog_state.get("features_backup"))
+    _write_watchdog_state(features=_features, test_mode=None, features_backup=None)
 
 
 def _yaw_diff(yaw, target):
@@ -1231,8 +1227,6 @@ _garden_cache = {"value": True, "at": 0.0}
 
 
 def 在花園() -> bool:
-    if _test_mode_flag:
-        return True
     area = get_tablist_info_confirmed("area").get("area") or ""
     result = area == "Garden"
     _garden_cache["value"] = result
@@ -1243,10 +1237,8 @@ def 在花園() -> bool:
 def _farm_actions_allowed(max_age=2.0) -> bool:
     """挖田相關動作的總閘門：不在 Garden（含剛下達撤離）一律不做，只剩待機或回 Garden 動作。
     沿用最近一次 在花園() 的結果，過舊才重讀 Area，避免高頻執行緒狂讀 Tab 列表。"""
-    if _evacuating():
+    if _restart_window():
         return False
-    if _test_mode_flag:
-        return True
     if time.monotonic() - _garden_cache["at"] > max_age:
         return 在花園()
     return _garden_cache["value"]
@@ -1303,7 +1295,7 @@ def anti_fail_monitor():
 
     while not _stop_event.is_set():
         _sync_target_from_item()
-        active = 開關 and not 害蟲處理中 and not anti_fail_hold.is_set() and not _evacuating() and 在花園()
+        active = 開關 and not 害蟲處理中 and not anti_fail_hold.is_set() and not _restart_window() and 在花園()
         if not active:
             wrong_yaw_since = None
             _stop_event.wait(0.15)
@@ -1607,6 +1599,7 @@ def 回到Garden(timeout=120.0):
             continue
 
         garden_since = None
+        _mark_left_garden_if_evacuating()
 
         if area:
             none_since = None
@@ -1652,7 +1645,7 @@ def 回Garden監控():
     echo("Garden 返回監控 Thread 啟動")
     garden_since = None
     while not _stop_event.is_set():
-        if not 開關 or _test_mode_flag:
+        if not 開關:
             等(1.0)
             continue
         area = get_tablist_info_confirmed("area").get("area")
@@ -1683,7 +1676,6 @@ def _panel_info():
         "pest_active": bool(害蟲處理中),
         "anti_fail": anti_fail_reason if anti_fail_hold.is_set() else None,
         "remaining": _format_timer_remaining(_run_deadline_at - now) if _run_deadline_at is not None else None,
-        "test_mode": bool(_test_mode_flag),
         "features": {name: _feature_on(name) for name in FEATURE_LABELS},
         "feature_labels": dict(FEATURE_LABELS),
         "pest_health": [_read_watchdog_state().get("pest_min_health"), _read_watchdog_state().get("pest_max_health")],
@@ -1691,11 +1683,12 @@ def _panel_info():
         "pitch": _target_pitch,
         "view_live": bool(_item_view_live),
         "return_target": dict(_return_target),
+        "view_text": _view_settings_text(),
     }
 
 
 def _process_discord_requests():
-    global 開關, _run_deadline_at, _target_yaw, _return_target, _test_mode_flag, _manual_pest_plot
+    global 開關, _run_deadline_at, _target_yaw, _return_target, _manual_pest_plot
     while True:
         try:
             pending = _remote_request_queue.get_nowait()
@@ -1704,108 +1697,7 @@ def _process_discord_requests():
 
         action = pending["action"]
         try:
-            if action == "hypixel_ban":
-                duration_seconds = max(1, int(pending.get("duration_seconds", 1)))
-                deadline = time.time() + duration_seconds
-
-                def _ban_countdown(until):
-                    remaining = max(0, int(until - time.time()))
-                    days, remaining = divmod(remaining, 86400)
-                    hours, remaining = divmod(remaining, 3600)
-                    minutes, seconds = divmod(remaining, 60)
-                    return f"{days}d {hours}h {minutes}m {seconds}s"
-
-                display_time = _ban_countdown(deadline)
-                開關 = False
-                _lifecycle["restart_f8"] = False
-                _lifecycle["auto_restart_at"] = None
-                _write_watchdog_state(
-                    f8=False,
-                    resume_f8=False,
-                    restart_pending=False,
-                    admin_lock=True,
-                    auto_restart_at=None,
-                )
-                with open(FARM_ADMIN_LOCK, "w", encoding="utf-8") as lock_file:
-                    json.dump(
-                        {
-                            "locked": True,
-                            "created_at": time.time(),
-                            "deadline": deadline,
-                            "duration_seconds": duration_seconds,
-                            "reason": "管理員鎖定",
-                        },
-                        lock_file,
-                        ensure_ascii=False,
-                    )
-                停止移動("管理員鎖定")
-                try:
-                    countdown_literal = json.dumps(display_time, ensure_ascii=False)
-                    _eval_pyjinn_script(f"""
-mc = JavaClass("net.minecraft.client.Minecraft").getInstance()
-server = mc.getCurrentServer()
-
-if server is not None:
-    address = str(server.ip).lower().strip()
-    host = address.split(":")[0].rstrip(".")
-
-    if host == "hypixel.net" or host.endswith(".hypixel.net"):
-        Component = JavaClass("net.minecraft.network.chat.Component")
-        Formatting = JavaClass("net.minecraft.ChatFormatting")
-
-        line1 = Component.literal("You are temporarily banned for ").withColor(0xFF5555)
-        line1 = line1.append(Component.literal({countdown_literal}).withColor(0xFFFFFF))
-        line1 = line1.append(Component.literal(" from this server!").withColor(0xFF5555))
-
-        line2 = Component.literal(
-            "Reason: Your account's security appeal was processed and the account "
-            "has entered a recovery phase and will be able to access the server "
-            "again after 30 days. Use this time to change passwords, emails and "
-            "security questions."
-        ).withColor(0xFFFFFF)
-
-        line3 = Component.literal("Find out more: ").withColor(0xAAAAAA)
-        url = Component.literal("https://www.hypixel.net/appeal").withColor(0x55FFFF).withStyle(Formatting.UNDERLINE)
-        line3 = line3.append(url)
-
-        message = Component.literal("")
-        message = message.append(line1)
-        message = message.append(Component.literal("\\n"))
-        message = message.append(line2)
-        message = message.append(Component.literal("\\n"))
-        message = message.append(line3)
-
-        connection = mc.getConnection()
-        if connection is not None:
-            connection.getConnection().disconnect(message)
-""")
-                except Exception as exc:
-                    echo(f"§c已鎖定，但自訂斷線畫面顯示失敗：{type(exc).__name__}: {exc}")
-                echo(f"§c管理員鎖定：F8 已關閉；倒數：{display_time}；按 F10 才能解除")
-                pending["result"] = {
-                    "ok": True,
-                    "message": f"已停止 FarmBot 並鎖定重新加入。倒數：{display_time}；時間歸零後仍需在 Minecraft 按 F10 才能解除。",
-                }
-            elif action == "admin_unlock":
-                try:
-                    os.remove(FARM_ADMIN_LOCK)
-                except FileNotFoundError:
-                    pass
-                _lifecycle["restart_f8"] = False
-                _lifecycle["auto_restart_at"] = None
-                _write_watchdog_state(
-                    f8=False,
-                    resume_f8=False,
-                    restart_pending=False,
-                    admin_lock=False,
-                    auto_restart_at=None,
-                )
-                echo("§a管理員已解除 FarmBot 緊急鎖定；F8 維持關閉")
-                pending["result"] = {
-                    "ok": True,
-                    "message": "已解除緊急鎖定；F8 仍維持關閉，需手動確認後再啟動。",
-                }
-            elif action == "toggle":
+            if action == "toggle":
                 開關 = not 開關
                 if 開關 and anti_fail_hold.is_set():
                     resumed = 恢復防故障暫停()
@@ -1821,16 +1713,6 @@ if server is not None:
                 pending["result"] = {
                     "ok": bool(resumed),
                     "message": f"遠端 F8 切換完成：{'開' if 開關 else '關'}" if resumed else "Anti-Fail 位置／視角檢查未通過，仍保持暫停",
-                }
-            elif action == "status":
-                remaining_text = (
-                    _format_timer_remaining(_run_deadline_at - time.time())
-                    if _run_deadline_at is not None else "尚未開始計時"
-                )
-                pending["result"] = {
-                    "ok": True,
-                    "status": f"F8={'開' if 開關 else '關'} · 農業={'進行中' if 農業中 else '暫停'} · 除蟲={'進行中' if 害蟲處理中 else '否'} · 計時剩餘={remaining_text} · Anti-Fail={'鎖定：' + anti_fail_reason if anti_fail_hold.is_set() else '正常'}",
-                    "message": f"F8={'開' if 開關 else '關'}；農業={'進行中' if 農業中 else '暫停'}；除蟲={'進行中' if 害蟲處理中 else '否'}；計時剩餘={remaining_text}；Anti-Fail={'鎖定：' + anti_fail_reason if anti_fail_hold.is_set() else '正常'}；{_view_settings_text()}",
                 }
             elif action == "add_time":
                 try:
@@ -1854,8 +1736,6 @@ if server is not None:
                     message = f"已加時 {add_minutes} 分鐘，距離登出並結束約 {remaining_text}。"
                     echo(f"Discord 遠端加時：+{add_minutes} 分鐘；剩餘 {remaining_text}")
                     pending["result"] = {"ok": True, "message": message}
-            elif action == "get_view":
-                pending["result"] = {"ok": True, "message": _view_settings_text()}
             elif action == "set_view":
                 params = pending.get("params") or {}
                 if params.get("reset"):
@@ -1905,28 +1785,6 @@ if server is not None:
                 _write_watchdog_state(features=_features)
                 echo(f"Discord 功能開關：{FEATURE_LABELS[name]} → {'開' if new_value else '關'}")
                 pending["result"] = {"ok": True, "message": f"{FEATURE_LABELS[name]} 已{'開啟' if new_value else '關閉'}"}
-            elif action == "set_test_mode":
-                params = pending.get("params") or {}
-                value = params.get("value")
-                new_value = (not _test_mode_flag) if value in (None, "toggle") else bool(value)
-                if new_value and not _test_mode_flag:
-                    # 進入測試模式：備份目前功能開關，並關掉 Hypixel 專屬功能
-                    _write_watchdog_state(features_backup=dict(_features))
-                    for name in HYPIXEL_ONLY_FEATURES:
-                        _features[name] = False
-                elif not new_value and _test_mode_flag:
-                    backup = _read_watchdog_state().get("features_backup")
-                    restored = _sanitize_features(backup)
-                    _features.clear()
-                    _features.update(restored)
-                _test_mode_flag = new_value
-                _write_watchdog_state(test_mode=_test_mode_flag, features=_features)
-                echo(f"Discord 測試模式：{'開' if _test_mode_flag else '關'}")
-                pending["result"] = {
-                    "ok": True,
-                    "message": "測試模式已開啟：忽略 Garden 判定，攔截 Hypixel 專屬指令，並關閉換裝／賣出／噴霧／Bonus" if _test_mode_flag
-                    else "測試模式已關閉，功能開關已還原",
-                }
             elif action == "set_pest_health":
                 params = pending.get("params") or {}
                 if params.get("reset"):
@@ -1942,16 +1800,14 @@ if server is not None:
             elif action == "pest_now":
                 params = pending.get("params") or {}
                 plot_value = int(params.get("plot", 0))
-                if not _test_mode_flag and not 1 <= plot_value <= 24:
-                    raise ValueError("非測試模式需指定 Plot 1 到 24")
-                if not 0 <= plot_value <= 24:
-                    raise ValueError("Plot 需介於 0（目前位置，測試用）到 24")
+                if not 1 <= plot_value <= 24:
+                    raise ValueError("Plot 需介於 1 到 24")
                 if not 開關:
                     raise ValueError("F8 目前是關閉的，請先開啟再除蟲")
                 if not _feature_on("pest"):
                     raise ValueError("除蟲功能目前是關閉的")
                 _manual_pest_plot = plot_value
-                pending["result"] = {"ok": True, "message": f"已排入手動除蟲：{'目前位置' if plot_value == 0 else f'Plot {plot_value}'}"}
+                pending["result"] = {"ok": True, "message": f"已排入手動除蟲：Plot {plot_value}"}
             elif action == "resume_anti_fail":
                 if not anti_fail_hold.is_set():
                     pending["result"] = {"ok": True, "message": "目前沒有 Anti-Fail 暫停"}
@@ -2187,7 +2043,7 @@ def 傳回農田初始點():
             """被傳到 Hub／伺服器重啟時立刻放棄回位流程並釋放 action_lock，
             讓「回Garden監控」能取得鎖去 /warp garden。"""
             global 農業中
-            if _test_mode_flag or (not _evacuating() and 在花園()):
+            if not _evacuating() and 在花園():
                 return False
             echo(f"§e[回農田] {階段}：偵測到已不在 Garden，中止回位並交給 Garden 返回監控")
             停止移動("回農田流程偵測到離開 Garden")
@@ -2318,13 +2174,13 @@ def farming_move():
     echo("挖田移動 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _evacuating():
+        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _restart_window():
             # 背景待機時不碰按鍵，避免與其他控制流程競爭。
             等(0.2)
             continue
 
         with action_lock:
-            if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _evacuating():
+            if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _restart_window():
                 continue
 
             if get_main_hand_item().get("slot") != HOE:
@@ -2426,7 +2282,7 @@ def crop_monitor():
     無作物確認次數 = 0
 
     while not _stop_event.is_set():
-        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _evacuating():
+        if not 開關 or not 農業中 or 害蟲處理中 or anti_fail_hold.is_set() or not 在花園() or _restart_window():
             無作物確認次數 = 0
             等(0.5)
             continue
@@ -2466,16 +2322,14 @@ def pest_monitor():
     echo("害蟲偵測 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or not _feature_on("pest") or _reboot_imminent() or _evacuating():
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or not _feature_on("pest") or _restart_window():
             等(2)
             continue
 
         manual_plot = _manual_pest_plot
         if manual_plot is not None:
             _manual_pest_plot = None
-            plots_str = str(manual_plot)      # Discord 手動除蟲（0 = 目前位置，測試用）
-        elif _test_mode_flag:
-            plots_str = ""                    # 單人存檔沒有 TAB 的 Plots 欄位
+            plots_str = str(manual_plot)      # Discord 手動除蟲（指定 Plot 1~24）
         else:
             plots_str = get_tablist_info_confirmed("Plots").get("Plots") or ""
 
@@ -2498,7 +2352,7 @@ def pest_monitor():
             echo(f"發現害蟲 Plot {plot}，先切換衣櫥套裝")
 
             # 除蟲時固定使用 FARM（財富／Rose Dragon）；不要等 READY 冷卻自行變動。
-            # 換裝功能關閉時（例如測試模式）沒有人會設定 裝備優先完成，直接略過等待。
+            # 換裝功能關閉時沒有人會設定 裝備優先完成，直接略過等待。
             while _feature_on("equipment") and not _stop_event.is_set():
                 裝備優先完成.wait(PEST_COOLDOWN_POLL_SECONDS)
                 if _stop_event.is_set():
@@ -2541,14 +2395,14 @@ def pest_monitor():
                 停止移動("返回 Garden 後")
 
                 returned_plot = 確認所在Plot()
-                if not _test_mode_flag and (not 在花園() or returned_plot is None):
+                if not 在花園() or returned_plot is None:
                     待處理害蟲_plot = None
                     裝備優先完成.clear()
                     害蟲處理中 = False
                     啟動防故障暫停("除蟲返回後未能確認 Garden 與所在 Plot")
                     continue
 
-                if not _test_mode_flag and not 校正農田視角():
+                if not 校正農田視角():
                     待處理害蟲_plot = None
                     裝備優先完成.clear()
                     害蟲處理中 = False
@@ -2580,7 +2434,7 @@ def equipment_monitor():
     echo("裝備切換 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _evacuating() or not _feature_on("equipment"):
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _restart_window() or not _feature_on("equipment"):
             等(1.0)
             continue
 
@@ -3067,7 +2921,7 @@ def spray_monitor():
     last_attempt = 0.0
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _evacuating() or not _feature_on("spray"):
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _restart_window() or not _feature_on("spray"):
             等(5.0)
             continue
 
@@ -3136,7 +2990,7 @@ def bonus_續費_monitor():
     echo("Bonus 藥水續費 Thread 啟動")
 
     while not _stop_event.is_set():
-        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _evacuating() or not _feature_on("bonus"):
+        if not 開關 or anti_fail_hold.is_set() or not 在花園() or _restart_window() or not _feature_on("bonus"):
             等(5.0)
             continue
 
@@ -3257,7 +3111,7 @@ def main():
     control_thread = threading.Thread(target=_discord_control_server, daemon=True)
     control_thread.start()
     _start_survival_watchdog()
-    if 開關 and not _test_mode_flag and get_tablist_info_confirmed("area").get("area") != "Garden":
+    if 開關 and get_tablist_info_confirmed("area").get("area") != "Garden":
         回到Garden()
     _start_discord_bot()
 

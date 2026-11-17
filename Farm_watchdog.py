@@ -638,26 +638,21 @@ async def is_authorized(interaction: discord.Interaction) -> bool:
     return True
 
 
-@bot.tree.command(name="hypixel_ban_stop", description="遠端停止 Hypixel 斷線倒數")
-async def hypixel_ban_stop(interaction: discord.Interaction) -> None:
+@bot.tree.command(name="hypixel_ban", description="設定或停止 Hypixel 斷線倒數")
+@app_commands.rename(duration="time")
+@app_commands.describe(duration="倒數時間，例如 1145d 15h 或 29d 17h 34m 51s；填 off 停止並清除倒數")
+async def hypixel_ban(interaction: discord.Interaction, duration: str) -> None:
+    global _BAN_LOCAL_PAUSED
     if interaction.user.id not in BAN_ADMIN_IDS:
         await interaction.response.send_message("你沒有使用此指令的權限。", ephemeral=True)
         return
 
-    clear_ban_deadline()
-    global _BAN_LOCAL_PAUSED
-    _BAN_LOCAL_PAUSED = False
-    await interaction.response.send_message(
-        "已遠端停止 Hypixel 倒數攔截，並清除保存的截止時間。"
-    )
-
-
-@bot.tree.command(name="hypixel_ban", description="設定 Hypixel 斷線倒數")
-@app_commands.rename(duration="time")
-@app_commands.describe(duration="倒數時間，例如 1145d 15h 或 29d 17h 34m 51s")
-async def hypixel_ban(interaction: discord.Interaction, duration: str) -> None:
-    if interaction.user.id not in BAN_ADMIN_IDS:
-        await interaction.response.send_message("你沒有使用此指令的權限。", ephemeral=True)
+    if duration.strip().lower() in ("off", "stop"):
+        clear_ban_deadline()
+        _BAN_LOCAL_PAUSED = False
+        await interaction.response.send_message(
+            "已遠端停止 Hypixel 倒數攔截，並清除保存的截止時間。"
+        )
         return
 
     try:
@@ -670,7 +665,7 @@ async def hypixel_ban(interaction: discord.Interaction, duration: str) -> None:
     await interaction.response.send_message(
         f"Hypixel 倒數已設定：`{format_ban_duration(seconds)}`\n"
         f"截止時間：`<t:{int(deadline)}:F>`\n"
-        "Watchdog 會獨立維護倒數；F10 可解除攔截。",
+        "Watchdog 會獨立維護倒數；F10 可暫停攔截，`/hypixel_ban time:off` 可停止並清除。",
         ephemeral=True,
     )
 
@@ -694,6 +689,11 @@ async def on_ready() -> None:
         if guild is not None:
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
+            if not getattr(bot, "_global_commands_purged", False):
+                # 舊版若曾把指令註冊成全域，Discord 會同時顯示全域與伺服器兩份；伺服器版已同步，這裡清掉全域那份。
+                bot.tree.clear_commands(guild=None)
+                await bot.tree.sync()
+                bot._global_commands_purged = True
         else:
             synced = await bot.tree.sync()
         _discord_log(f"指令同步成功：{', '.join(c.name for c in synced)}")
@@ -707,56 +707,7 @@ async def on_ready() -> None:
     print(f"FarmBot Discord bridge ready as {bot.user}")
 
 
-@bot.tree.command(name="farm_toggle", description="遠端切換 Farm.py 的 F8 開關")
-async def farm_toggle(interaction: discord.Interaction) -> None:
-    if not await is_authorized(interaction):
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    result = await asyncio.to_thread(request_farm, "toggle")
-    await interaction.followup.send(
-        result.get("message", result.get("error", "操作失敗")),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="farm_restart", description="遠端重新啟動 Farm.py")
-async def farm_restart(interaction: discord.Interaction) -> None:
-    if not await is_authorized(interaction):
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    result = await asyncio.to_thread(request_farm, "restart")
-    await interaction.followup.send(
-        result.get("message", result.get("error", "操作失敗")),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="farm_status", description="查看 Farm.py 開關與工作狀態")
-async def farm_status(interaction: discord.Interaction) -> None:
-    if not await is_authorized(interaction):
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    result = await asyncio.to_thread(request_farm, "status")
-    await interaction.followup.send(
-        result.get("message", result.get("error", "操作失敗")),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="farm_add_time", description="延長目前 Farm.py 的運行時間")
-@app_commands.describe(minutes="要增加的分鐘數（1 到 1440）")
-async def farm_add_time(interaction: discord.Interaction, minutes: app_commands.Range[int, 1, 1440]) -> None:
-    if not await is_authorized(interaction):
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    result = await asyncio.to_thread(request_farm, "add_time", minutes=minutes)
-    await interaction.followup.send(
-        result.get("message", result.get("error", "操作失敗")),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="farm_return_target", description="設定回程 AOTV 目標點（存入 json；不填任何參數則顯示目前值）")
+@bot.tree.command(name="farm_return", description="設定回程 AOTV 目標點（目前設定顯示在 /farm 面板）")
 @app_commands.describe(
     plot="回程先傳送到的 Plot（1 到 24，預設 13）",
     block="AOTV 要瞄準的方塊 id，例如 minecraft:gold_block（填 none 停用，改回座標瞄準）",
@@ -768,7 +719,7 @@ async def farm_add_time(interaction: discord.Interaction, minutes: app_commands.
     x_max="（座標模式）看向的 X 隨機範圍上限（預設 -80）",
     reset="還原所有預設值（視角與回程目標）",
 )
-async def farm_return_target(
+async def farm_return(
     interaction: discord.Interaction,
     plot: app_commands.Range[int, 1, 24] | None = None,
     block: str | None = None,
@@ -782,17 +733,21 @@ async def farm_return_target(
 ) -> None:
     if not await is_authorized(interaction):
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
     values = {"plot": plot, "block": block, "radius": radius, "z": z, "y": y, "x_min": x_min, "x_max": x_max}
     values = {key: value for key, value in values.items() if value is not None}
     if crosshair:
         values["crosshair"] = True
+    if not values and not reset:
+        await interaction.response.send_message(
+            "沒有指定任何參數。目前的視角／回程設定顯示在 `/farm` 面板的「視角／回程」。",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     if reset:
         result = await asyncio.to_thread(request_farm, "set_view", reset=True)
-    elif values:
-        result = await asyncio.to_thread(request_farm, "set_view", **values)
     else:
-        result = await asyncio.to_thread(request_farm, "get_view")
+        result = await asyncio.to_thread(request_farm, "set_view", **values)
     await interaction.followup.send(
         result.get("message", result.get("error", "操作失敗")),
         ephemeral=True,
@@ -800,7 +755,7 @@ async def farm_return_target(
 
 
 # ═════════════════════════════════════════════
-# 完整控制面板：/farm_panel
+# 控制面板：/farm（狀態、F8、重啟、加時、功能開關、除蟲、Anti-Fail 都只在這裡）
 # ═════════════════════════════════════════════
 PANEL_FEATURES = (
     ("pest", "除蟲"),
@@ -821,7 +776,7 @@ async def fetch_panel() -> tuple[dict | None, str | None]:
 def _health_text(info: dict) -> str:
     low, high = (info.get("pest_health") or [None, None])[:2]
     if low is None or high is None:
-        return "預設（一般 100~2000；測試模式任何 HP > 0）"
+        return "預設（100~2000）"
     return f"{low:g} < HP < {high:g}"
 
 
@@ -829,7 +784,7 @@ def build_panel_embed(info: dict | None, error: str | None = None) -> discord.Em
     if info is None:
         return discord.Embed(
             title="FarmBot 控制面板",
-            description=f"❌ Farm.py 沒有回應\n{error or ''}".strip(),
+            description=f"❌ Farm.py 沒有回應（仍可按「重啟 Farm」）\n{error or ''}".strip(),
             color=0xE74C3C,
         )
     embed = discord.Embed(title="FarmBot 控制面板", color=0x2ECC71 if info.get("f8") else 0x95A5A6)
@@ -839,7 +794,6 @@ def build_panel_embed(info: dict | None, error: str | None = None) -> discord.Em
         f"農業：{'進行中' if info.get('farming') else '暫停'} · 除蟲：{'進行中' if info.get('pest_active') else '否'}",
         f"計時剩餘：{info.get('remaining') or '尚未開始計時'}",
         f"Anti-Fail：{'🔴 鎖定 — ' + str(anti_fail) if anti_fail else '正常'}",
-        f"測試模式：{'🧪 開（單人存檔）' if info.get('test_mode') else '關'}",
     ]
     embed.add_field(name="狀態", value="\n".join(state_lines), inline=False)
     features = info.get("features") or {}
@@ -848,19 +802,8 @@ def build_panel_embed(info: dict | None, error: str | None = None) -> discord.Em
         value=" · ".join(f"{'🟢' if features.get(key, True) else '⚪'} {label}" for key, label in PANEL_FEATURES),
         inline=False,
     )
-    embed.add_field(name="蟲血量範圍", value=_health_text(info), inline=True)
-    target = info.get("return_target") or {}
-    embed.add_field(
-        name="視角／回程",
-        value=(
-            f"yaw {info.get('yaw'):g} / pitch "
-            + (f"{info.get('pitch'):g}" if info.get("pitch") is not None else "?")
-            + (" (糾正物品)" if info.get("view_live") else " (上次記錄)")
-            + f" · Plot {target.get('plot')} · "
-            + (f"瞄準 {target['block']}（r={target.get('radius')}）" if target.get("block") else "座標瞄準")
-        ) if info.get("yaw") is not None else "—",
-        inline=True,
-    )
+    embed.add_field(name="蟲血量範圍", value=_health_text(info), inline=False)
+    embed.add_field(name="視角／回程", value=info.get("view_text") or "—", inline=False)
     taiwan_time = timezone(timedelta(hours=8), name="Taiwan")
     embed.set_footer(text=datetime.now(taiwan_time).strftime("更新於 %H:%M:%S 台灣時間"))
     return embed
@@ -876,6 +819,8 @@ class PanelButton(discord.ui.Button):
 
 
 class PanelView(discord.ui.View):
+    """第 0 列：核心操作；第 1 列：功能開關；第 2 列：需要輸入數值的操作（彈出表單）與 Anti-Fail。"""
+
     def __init__(self, info: dict | None = None) -> None:
         super().__init__(timeout=None)
         info = info or {}
@@ -883,24 +828,39 @@ class PanelView(discord.ui.View):
         f8_on = bool(info.get("f8"))
         S = discord.ButtonStyle
         self.add_item(PanelButton("f8", "F8 關閉" if f8_on else "F8 開啟", S.danger if f8_on else S.success, 0))
-        self.add_item(PanelButton("refresh", "重新整理", S.secondary, 0))
         self.add_item(PanelButton("restart", "重啟 Farm", S.secondary, 0))
+        self.add_item(PanelButton("refresh", "重新整理", S.secondary, 0))
         for key, label in PANEL_FEATURES:
             on = features.get(key, True)
             self.add_item(PanelButton(f"feat:{key}", f"{label} {'ON' if on else 'OFF'}", S.success if on else S.secondary, 1))
-        test_on = bool(info.get("test_mode"))
-        self.add_item(PanelButton("test", f"測試模式 {'ON' if test_on else 'OFF'}", S.primary if test_on else S.secondary, 2))
         self.add_item(PanelButton("pestnow", "立即除蟲", S.primary, 2))
-        self.add_item(PanelButton("antifail", "解除 Anti-Fail", S.secondary, 2))
-        self.add_item(PanelButton("add30", "加時 30 分", S.secondary, 2))
         self.add_item(PanelButton("health", "蟲血量", S.secondary, 2))
+        self.add_item(PanelButton("addtime", "加時", S.secondary, 2))
+        self.add_item(PanelButton("antifail", "解除 Anti-Fail", S.secondary, 2))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await is_authorized(interaction)
 
 
+async def _refresh_panel_message(interaction: discord.Interaction) -> None:
+    """表單送出後順手更新原面板（拿不到原訊息就算了，按「重新整理」即可）。"""
+    message = getattr(interaction, "message", None)
+    if message is None:
+        return
+    info, error = await fetch_panel()
+    try:
+        await message.edit(embed=build_panel_embed(info, error), view=PanelView(info))
+    except discord.HTTPException:
+        pass
+
+
+async def _modal_reply(interaction: discord.Interaction, result: dict) -> None:
+    await interaction.followup.send(result.get("message", result.get("error", "操作失敗")), ephemeral=True)
+    await _refresh_panel_message(interaction)
+
+
 class PestNowModal(discord.ui.Modal, title="立即除蟲"):
-    plot = discord.ui.TextInput(label="Plot（1~24；測試模式可填 0＝目前位置）", default="0", max_length=2)
+    plot = discord.ui.TextInput(label="Plot（1~24）", placeholder="例：13", max_length=2)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -909,8 +869,7 @@ class PestNowModal(discord.ui.Modal, title="立即除蟲"):
         except ValueError:
             await interaction.followup.send("Plot 必須是數字。", ephemeral=True)
             return
-        result = await asyncio.to_thread(request_farm, "pest_now", plot=plot)
-        await interaction.followup.send(result.get("message", result.get("error", "操作失敗")), ephemeral=True)
+        await _modal_reply(interaction, await asyncio.to_thread(request_farm, "pest_now", plot=plot))
 
 
 class PestHealthModal(discord.ui.Modal, title="蟲血量範圍"):
@@ -929,15 +888,31 @@ class PestHealthModal(discord.ui.Modal, title="蟲血量範圍"):
                 await interaction.followup.send("下限與上限都要填數字（或兩格都留空還原）。", ephemeral=True)
                 return
             result = await asyncio.to_thread(request_farm, "set_pest_health", min=low, max=high)
-        await interaction.followup.send(result.get("message", result.get("error", "操作失敗")), ephemeral=True)
+        await _modal_reply(interaction, result)
 
 
-async def panel_dispatch(interaction: discord.Interaction, key: str, value=None) -> None:
-    if key == "pestnow":
-        await interaction.response.send_modal(PestNowModal())
-        return
-    if key == "health":
-        await interaction.response.send_modal(PestHealthModal())
+class AddTimeModal(discord.ui.Modal, title="加時"):
+    minutes = discord.ui.TextInput(label="增加的分鐘數（1~1440）", default="30", max_length=4)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            minutes = int(str(self.minutes.value).strip())
+        except ValueError:
+            await interaction.followup.send("分鐘數必須是整數。", ephemeral=True)
+            return
+        if not 1 <= minutes <= 1440:
+            await interaction.followup.send("分鐘數需介於 1 到 1440。", ephemeral=True)
+            return
+        await _modal_reply(interaction, await asyncio.to_thread(request_farm, "add_time", minutes=minutes))
+
+
+PANEL_MODALS = {"pestnow": PestNowModal, "health": PestHealthModal, "addtime": AddTimeModal}
+
+
+async def panel_dispatch(interaction: discord.Interaction, key: str) -> None:
+    if key in PANEL_MODALS:
+        await interaction.response.send_modal(PANEL_MODALS[key]())
         return
 
     await interaction.response.defer()
@@ -948,12 +923,8 @@ async def panel_dispatch(interaction: discord.Interaction, key: str, value=None)
         result = await asyncio.to_thread(request_farm, "restart", 15.0)
     elif key.startswith("feat:"):
         result = await asyncio.to_thread(request_farm, "set_feature", name=key.split(":", 1)[1], value="toggle")
-    elif key == "test":
-        result = await asyncio.to_thread(request_farm, "set_test_mode", value="toggle")
     elif key == "antifail":
         result = await asyncio.to_thread(request_farm, "resume_anti_fail")
-    elif key == "add30":
-        result = await asyncio.to_thread(request_farm, "add_time", minutes=30)
 
     if key == "restart":
         await asyncio.sleep(2.5)   # 新 job 需要一點時間開 socket
@@ -968,8 +939,8 @@ async def panel_dispatch(interaction: discord.Interaction, key: str, value=None)
             await interaction.followup.send(message, ephemeral=True)
 
 
-@bot.tree.command(name="farm_panel", description="開啟 FarmBot 完整控制面板（按鈕＋測試模式）")
-async def farm_panel(interaction: discord.Interaction) -> None:
+@bot.tree.command(name="farm", description="開啟 FarmBot 控制面板：狀態、F8、重啟、加時、功能開關、除蟲、Anti-Fail")
+async def farm(interaction: discord.Interaction) -> None:
     if not await is_authorized(interaction):
         return
     await interaction.response.defer(thinking=True)
